@@ -158,6 +158,8 @@ class DFlashVerifyInput(SpecInput):
     draft_token: torch.Tensor
     positions: torch.Tensor
     draft_token_num: int
+    mamba_cache_steps: int | None = None
+    mamba_replay: bool = False
     # Kept for compatibility with attention backends that gate tree metadata by `topk > 1`.
     # DFLASH verify is linear (non-tree), so this is always 1.
     topk: int = 1
@@ -363,6 +365,17 @@ class DFlashVerifyInput(SpecInput):
                 )
 
         candidates = self.draft_token.view(bs, self.draft_token_num)
+        if (
+            self.mamba_cache_steps is not None
+            and self.mamba_cache_steps < self.draft_token_num
+            and not self.mamba_replay
+        ):
+            raise RuntimeError(
+                "DFLASH reduced Mamba/GDN cache requires replay, but replay was "
+                "not enabled. This should be auto-enabled when "
+                "speculative_dflash_mamba_cache_steps < speculative_num_draft_tokens."
+            )
+
         if (
             sampling_info is not None
             and not sampling_info.is_all_greedy

@@ -1138,6 +1138,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 draft_token=None,
                 positions=None,
                 draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,
+                mamba_cache_steps=(
+                    self.model_runner.server_args.speculative_dflash_mamba_cache_steps
+                ),
+                mamba_replay=(
+                    self.model_runner.server_args.speculative_dflash_mamba_replay
+                ),
                 custom_mask=(
                     None
                     if (self.model_runner.is_draft_worker or not build_custom_mask)

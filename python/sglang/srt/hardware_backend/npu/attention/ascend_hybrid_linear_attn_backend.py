@@ -218,10 +218,12 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
 
     def update_mamba_state_after_mtp_verify(
         self,
-        last_correct_step_indices: torch.Tensor,
-        mamba_track_indices: Optional[torch.Tensor],
-        mamba_steps_to_track: Optional[torch.Tensor],
-        model,
+        last_correct_step_indices: Optional[torch.Tensor] = None,
+        mamba_track_indices: Optional[torch.Tensor] = None,
+        mamba_steps_to_track: Optional[torch.Tensor] = None,
+        model=None,
+        accepted_steps: Optional[torch.Tensor] = None,
+        accepted_lengths: Optional[torch.Tensor] = None,
     ):
         """
         Update mamba states after MTP verify using fully fused Triton kernel.
@@ -232,7 +234,34 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         - index_select kernel launches
         - nonzero kernel launches
         """
-        request_number = last_correct_step_indices.shape[0]
+        if accepted_steps is None:
+            if last_correct_step_indices is None:
+                raise ValueError(
+                    "update_mamba_state_after_mtp_verify requires accepted_steps "
+                    "or last_correct_step_indices."
+                )
+            accepted_steps = last_correct_step_indices
+
+        mamba_cache_steps = getattr(
+            self.linear_attn_backend.forward_metadata, "mamba_cache_steps", None
+        )
+        mamba_replay = bool(
+            getattr(self.linear_attn_backend.forward_metadata, "mamba_replay", False)
+        )
+        draft_token_num = int(
+            self.linear_attn_backend.forward_metadata.draft_token_num
+        )
+        if (
+            mamba_replay
+            and mamba_cache_steps is not None
+            and int(mamba_cache_steps) < draft_token_num
+        ):
+            raise NotImplementedError(
+                "DFLASH Mamba replay is only implemented for CUDA hybrid linear "
+                "attention backends."
+            )
+
+        request_number = accepted_steps.shape[0]
 
         state_indices_tensor = (
             self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -253,7 +282,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
             device=dst_indices_tensor.device,
             dtype=torch.int64,
         )
-        last_steps = last_correct_step_indices.to(torch.int64)  # [N]
+        last_steps = accepted_steps.to(torch.int64)  # [N]
 
         move_intermediate_cache(
             ssm_states,
