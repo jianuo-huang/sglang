@@ -394,6 +394,24 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ]
             )
 
+    def init_forward_metadata_out_graph(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool = False,
+    ):
+        super().init_forward_metadata_out_graph(
+            forward_batch, in_capture=in_capture
+        )
+        self._verify_replay_graph_bs = None
+        if not forward_batch.forward_mode.is_target_verify():
+            return
+        if in_capture:
+            return
+        if self._verify_replay_inputs_graph_static:
+            self._verify_replay_graph_bs = forward_batch.batch_size
+        else:
+            self._verify_replay_inputs.clear()
+
     def init_forward_metadata_capture_cuda_graph(
         self,
         bs: int,
