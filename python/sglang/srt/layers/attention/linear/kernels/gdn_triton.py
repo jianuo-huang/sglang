@@ -163,7 +163,9 @@ class TritonGDNKernel(LinearAttnKernelBase):
             b=b,
             initial_state_source=ssm_states,
             initial_state_indices=(
-                cache_indices if initial_state_indices is None else initial_state_indices
+                cache_indices
+                if initial_state_indices is None
+                else initial_state_indices
             ),
             output_state_indices=cache_indices,
             cu_seqlens=query_start_loc,

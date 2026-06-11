@@ -124,8 +124,7 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
     if HAS_INPUT_SEQUENCE_INDICES:
         physical_t = (
-            tl.load(input_sequence_indices + i_n).to(tl.int64)
-            * input_token_stride
+            tl.load(input_sequence_indices + i_n).to(tl.int64) * input_token_stride
             + input_token_start
         )
         p_k = k + physical_t * stride_k + i_h * K + o_k
@@ -355,27 +354,27 @@ def fused_sigmoid_gating_delta_rule_update(
     B, T, H, K, V = *k.shape, v.shape[-1]
     if input_token_indices is not None:
         assert cu_seqlens is not None, "input_token_indices requires cu_seqlens"
-        assert disable_output_calculation, (
-            "input_token_indices is only supported for state-only replay"
-        )
+        assert (
+            disable_output_calculation
+        ), "input_token_indices is only supported for state-only replay"
     if input_sequence_indices is not None:
-        assert cu_seqlens is not None or input_sequence_lengths is not None, (
-            "input_sequence_indices requires cu_seqlens or input_sequence_lengths"
-        )
-        assert input_token_indices is None, (
-            "input_sequence_indices and input_token_indices are mutually exclusive"
-        )
-        assert disable_output_calculation, (
-            "input_sequence_indices is only supported for state-only replay"
-        )
+        assert (
+            cu_seqlens is not None or input_sequence_lengths is not None
+        ), "input_sequence_indices requires cu_seqlens or input_sequence_lengths"
+        assert (
+            input_token_indices is None
+        ), "input_sequence_indices and input_token_indices are mutually exclusive"
+        assert (
+            disable_output_calculation
+        ), "input_sequence_indices is only supported for state-only replay"
     if input_sequence_lengths is not None:
         assert input_sequence_indices is not None or input_token_stride > 0, (
             "input_sequence_lengths requires input_sequence_indices or "
             "a positive input_token_stride"
         )
-        assert disable_output_calculation, (
-            "input_sequence_lengths is only supported for state-only replay"
-        )
+        assert (
+            disable_output_calculation
+        ), "input_sequence_lengths is only supported for state-only replay"
     if output_state_indices is None:
         output_state_indices = initial_state_indices
     stride_q = q.stride()[1]

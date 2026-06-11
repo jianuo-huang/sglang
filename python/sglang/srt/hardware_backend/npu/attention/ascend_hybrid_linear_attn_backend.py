@@ -248,9 +248,7 @@ class AscendHybridLinearAttnBackend(HybridLinearAttnBackend):
         mamba_replay = bool(
             getattr(self.linear_attn_backend.forward_metadata, "mamba_replay", False)
         )
-        draft_token_num = int(
-            self.linear_attn_backend.forward_metadata.draft_token_num
-        )
+        draft_token_num = int(self.linear_attn_backend.forward_metadata.draft_token_num)
         if (
             mamba_replay
             and mamba_cache_steps is not None

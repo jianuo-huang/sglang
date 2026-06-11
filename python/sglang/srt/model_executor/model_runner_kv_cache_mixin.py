@@ -155,8 +155,7 @@ class ModelRunnerKVCacheMixin:
                 ratio = self._calculate_mamba_ratio()
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes
-                    // (per_req + intermediate_cache_per_req / ratio)
+                    mamba_budget_bytes // (per_req + intermediate_cache_per_req / ratio)
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total

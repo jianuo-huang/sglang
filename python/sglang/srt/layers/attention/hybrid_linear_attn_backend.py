@@ -853,9 +853,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             self._mamba_zero_steps_cache[key] = zero_steps
         return zero_steps
 
-    def _clamp_mamba_steps(
-        self, steps: torch.Tensor, max_step: int
-    ) -> torch.Tensor:
+    def _clamp_mamba_steps(self, steps: torch.Tensor, max_step: int) -> torch.Tensor:
         if steps.dtype != torch.int32:
             return torch.clamp(steps, max=max_step)
 
@@ -1100,18 +1098,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_replay = bool(
             getattr(self.linear_attn_backend.forward_metadata, "mamba_replay", False)
         )
-        draft_token_num = int(
-            self.linear_attn_backend.forward_metadata.draft_token_num
-        )
+        draft_token_num = int(self.linear_attn_backend.forward_metadata.draft_token_num)
         replay_enabled = (
             mamba_replay
             and mamba_cache_steps is not None
             and int(mamba_cache_steps) < draft_token_num
         )
         effective_cache_steps = (
-            int(mamba_cache_steps)
-            if mamba_cache_steps is not None
-            else draft_token_num
+            int(mamba_cache_steps) if mamba_cache_steps is not None else draft_token_num
         )
         zero_cache_replay = replay_enabled and effective_cache_steps == 0
         dense_active_replay = replay_enabled and effective_cache_steps <= 1

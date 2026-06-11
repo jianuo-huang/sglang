@@ -399,9 +399,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        super().init_forward_metadata_out_graph(
-            forward_batch, in_capture=in_capture
-        )
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._verify_replay_graph_bs = None
         if not forward_batch.forward_mode.is_target_verify():
             return
@@ -648,7 +646,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     layer.dt_bias,
                     forward_batch.spec_info.draft_token_num,
                 )
-                if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                if (
+                    torch.cuda.is_available()
+                    and torch.cuda.is_current_stream_capturing()
+                ):
                     self._verify_replay_inputs_graph_static = True
                     self._verify_replay_inputs_by_graph_bs.setdefault(batch_size, {})[
                         layer.layer_id
@@ -740,9 +741,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 "were captured during target verify."
             )
 
-        _, _, _, _, _, _, draft_token_num = next(
-            iter(replay_inputs_by_layer.values())
-        )
+        _, _, _, _, _, _, draft_token_num = next(iter(replay_inputs_by_layer.values()))
         max_tail_len = int(draft_token_num) - int(mamba_cache_steps)
         if replay_all_requests or replay_raw_requests:
             request_number = target_steps.shape[0]
@@ -815,9 +814,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 return
 
             tail_lengths = (
-                target_steps[req_indices].to(torch.int32)
-                - int(mamba_cache_steps)
-                + 1
+                target_steps[req_indices].to(torch.int32) - int(mamba_cache_steps) + 1
             )
             replay_state_indices = destination_state_indices[req_indices]
             replay_initial_state_indices = (
