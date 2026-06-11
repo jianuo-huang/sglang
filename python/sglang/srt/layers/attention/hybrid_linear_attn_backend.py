@@ -242,6 +242,11 @@ class MambaAttnBackendBase(AttentionBackend):
             forward_batch.mamba_track_mask is not None
             and forward_batch.mamba_track_mask.any()
         )
+        draft_token_num = (
+            forward_batch.spec_info.draft_token_num
+            if forward_batch.spec_info is not None
+            else 1
+        )
 
         return ForwardMetadata(
             query_start_loc=query_start_loc,
@@ -255,6 +260,8 @@ class MambaAttnBackendBase(AttentionBackend):
             track_ssm_final_src=track_ssm_final_src,
             track_ssm_final_dst=track_ssm_final_dst,
             has_mamba_track_mask=has_mamba_track_mask,
+            is_target_verify=forward_batch.forward_mode.is_target_verify(),
+            draft_token_num=draft_token_num,
         )
 
     def init_forward_metadata_out_graph(
@@ -497,6 +504,7 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         mamba_indices = self.req_to_token_pool.get_mamba_indices(req_pool_indices)
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         mamba_cache_steps = (
             getattr(spec_info, "mamba_cache_steps", None)
             if spec_info is not None
@@ -519,6 +527,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
                 mamba_cache_steps=mamba_cache_steps,
                 mamba_replay=mamba_replay,
             )
@@ -526,6 +536,8 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
                 mamba_cache_steps=mamba_cache_steps,
                 mamba_replay=mamba_replay,
             )
@@ -575,6 +587,7 @@ class MambaAttnBackendBase(AttentionBackend):
                 )
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
+        draft_token_num = spec_info.draft_token_num if spec_info is not None else 1
         mamba_cache_steps = (
             getattr(spec_info, "mamba_cache_steps", None)
             if spec_info is not None
@@ -605,6 +618,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
                 mamba_cache_steps=mamba_cache_steps,
                 mamba_replay=mamba_replay,
             )
@@ -612,6 +627,8 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                is_target_verify=forward_mode.is_target_verify(),
+                draft_token_num=draft_token_num,
                 mamba_cache_steps=mamba_cache_steps,
                 mamba_replay=mamba_replay,
             )
