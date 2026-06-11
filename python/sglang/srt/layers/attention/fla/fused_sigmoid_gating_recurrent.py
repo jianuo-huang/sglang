@@ -137,6 +137,17 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
             p_a = a + physical_t * stride_a + i_hv * K + o_k
         else:
             p_a = a + physical_t * stride_a + i_hv
+    elif HAS_INPUT_SEQUENCE_LENGTHS:
+        physical_t = i_n * input_token_stride + input_token_start
+        p_k = k + physical_t * stride_k + i_h * K + o_k
+        p_v = v + physical_t * stride_v + i_hv * V + o_v
+        p_b = b + physical_t * stride_b + i_hv
+        if not DISABLE_OUTPUT_CALCULATION:
+            p_q = q + physical_t * stride_q + i_h * K + o_k
+        if IS_KDA:
+            p_a = a + physical_t * stride_a + i_hv * K + o_k
+        else:
+            p_a = a + physical_t * stride_a + i_hv
 
     b_h = tl.zeros([BK, BV], dtype=tl.float32)
     if USE_INITIAL_STATE:
@@ -358,8 +369,9 @@ def fused_sigmoid_gating_delta_rule_update(
             "input_sequence_indices is only supported for state-only replay"
         )
     if input_sequence_lengths is not None:
-        assert input_sequence_indices is not None, (
-            "input_sequence_lengths requires input_sequence_indices"
+        assert input_sequence_indices is not None or input_token_stride > 0, (
+            "input_sequence_lengths requires input_sequence_indices or "
+            "a positive input_token_stride"
         )
         assert disable_output_calculation, (
             "input_sequence_lengths is only supported for state-only replay"

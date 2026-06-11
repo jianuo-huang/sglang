@@ -746,8 +746,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
         max_tail_len = int(draft_token_num) - int(mamba_cache_steps)
         if replay_all_requests or replay_raw_requests:
             request_number = target_steps.shape[0]
-            req_indices = self._get_replay_req_indices(
-                request_number, target_steps.device
+            req_indices = (
+                self._get_replay_req_indices(request_number, target_steps.device)
+                if replay_raw_requests
+                else None
             )
             if (
                 target_lengths is not None
