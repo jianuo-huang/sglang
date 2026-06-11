@@ -16,9 +16,9 @@
 
 - 在固定 `mem_fraction_static=0.72` 下，`nvidia-smi` 看到的总显存占用接近不变，因为 SGLang 会把释放出来的中间状态预算转成更大的 KV/token capacity。
 - `K=0` 将 target intermediate SSM cache 从 `19.12 GB/rank` 降到 `0.00 GB/rank`，target token capacity 从 `276,228` 提升到 `725,617`，约 `2.63x`。
-- `K=4` 是当前比较均衡的点：intermediate SSM 为 `4.78 GB/rank`，target token capacity 为 `613,270`，约为 full-cache baseline 的 `2.22x`，吞吐与 `K=16` 接近。
-- `K=0` 吞吐低于 `K=1`，但差距在这轮随机 workload 下为 `3.3%` 到 `13.0%`，不是数量级退化。
-- 正确性仍有 blocker：固定 prompt exact-output 对比中，`K=0` 与 `K=16` 在 CUDA graph 下精确一致，但 `K=1/4/8` 在 CUDA graph 下存在文本差异；`K=1` 关闭 CUDA graph 后与 `K=16` 精确一致，说明 partial-K replay 的剩余问题集中在 CUDA graph 路径。
+- `K=4` 的内存/容量折中很好：intermediate SSM 为 `4.78 GB/rank`，target token capacity 为 `613,270`，约为 full-cache baseline 的 `2.22x`。
+- 当前 partial-K (`K=1/4/8`) 的 TPS 只能作为诊断数据，不能作为最终性能结论，因为对应 accept length 已经偏离 `K=16` baseline。
+- 正确性仍有 blocker：固定 prompt exact-output 对比中，`K=0` 与 `K=16` 在 CUDA graph 下精确一致，但 `K=1/4/8` 在 CUDA graph 下存在文本差异；`K=1` 关闭 CUDA graph 后与 `K=16` 精确一致。Serving 矩阵中的 mean accepted length 也显示 `K=1/4/8` 系统性低于 `K=0/16`，说明 partial-K replay 的剩余问题集中在 CUDA graph/post-verify state update 路径。
 
 因此当前分支已经有比较明确的显存和性能证据，但 partial-K CUDA graph correctness 修复前，不建议直接作为最终 PR 合入。
 
@@ -143,6 +143,8 @@ C: 1, 2, 4, 8, 16
 
 ## 性能结果
 
+注意：本节中 `K=1/4/8` 的性能结果是在 correctness blocker 尚未修复时采集的，只能用于定位和趋势参考。`K=0` 与 `K=16` 已通过 CUDA graph exact-output 对比；partial-K 的最终 TPS/latency 需要在 accept length 和 exact-output 对齐后重跑。
+
 Output TPS：
 
 | K/C | 1 | 2 | 4 | 8 | 16 |
@@ -193,12 +195,13 @@ Mean accepted length：
 | 8 | 3.71 | 3.70 | 3.67 | 3.68 | 3.69 |
 | 16 | 3.82 | 3.80 | 3.77 | 3.76 | 3.75 |
 
+这张表是 correctness blocker 的直接证据，不应解读为正常的 replay 性能差异。相同 prompt、相同 target/draft 模型下，`K` 只应该改变 target verify draft tokens 的 Mamba/GDN cache/replay 实现，不应该系统性改变接受长度。这里 `K=0` 与 `K=16` 基本对齐，而 `K=1/4/8` 全面偏低，说明 partial-cache replay 写回的 recurrent state 与 full-cache baseline 仍不等价。
+
 观察：
 
-- `K=0` 是显存最省的配置，吞吐低于 `K=1/4/8/16`，原因是 accepted tail 的 SSM state 全量依赖 replay。
-- `K=1` 相比 `K=0` 的 output TPS 提升为：C1 `+4.3%`，C2 `+3.3%`，C4 `+8.6%`，C8 `+9.7%`，C16 `+13.0%`。
-- 每个并发下本轮最高 output TPS 分别为：C1 `K=16`，C2 `K=16`，C4 `K=4`，C8 `K=8`，C16 `K=8`。
-- `K=4` 和 `K=8` 在吞吐上接近 full-cache baseline，同时显著降低 SSM intermediate cache。
+- `K=0` 是显存最省的已验证配置，吞吐低于 `K=16`，原因是 accepted tail 的 SSM state 全量依赖 replay。
+- `K=1/4/8` 在这轮中看起来有较高 TPS，但由于接受长度已经变小，不能作为有效加速结论。
+- 修复 partial-K correctness 后，需要重跑同样矩阵，并确认 accepted length 与 `K=16` 对齐后再比较 TPS。
 
 ## 显存和容量结果
 
@@ -276,6 +279,33 @@ PR 前需要继续修复：
 - `accepted_steps`、`accepted_lengths`、commit lengths 在 graph replay 中是否被正确复用或覆盖。
 - partial cached SSM scatter 后，再 replay uncached tail 的 source/destination state indices 是否在 graph 路径中使用了 stale tensor。
 - `K=0` graph 正确而 `K=1/4/8` graph 不正确，说明 zero-cache path 与 partial-cache path 的差异是优先排查范围。
+
+### 2026-06-11 follow-up
+
+对照旧工作分支 `dev/dflash-mamba-replay-study` 后确认，旧分支确实有一系列后续 GDN replay 修复和优化，包括：
+
+```text
+93338136e Support source-destination GDN replay
+db08467a9 Use sequence lengths for GDN replay
+df9a584f6 Use dense K1 GDN replay
+83ba1495c Reuse K1 GDN replay tail lengths
+8c8b5dab9 Guard K0 GDN replay length reuse
+```
+
+当前 upstream replay 分支只迁移了 replay 主线和一个 CUDA graph metadata 修复，没有完整迁移旧分支后续 patch。旧分支报告里记录过 accept length unchanged，因此当前 `K=1/4/8` accept length 下降不是预期行为。
+
+已尝试最小迁移旧分支的 dense replay sequence-length 寻址：
+
+- 在 `fused_sigmoid_gating_recurrent.py` 中允许 `input_sequence_lengths + input_token_stride` 做物理位置寻址。
+- 在 `gdn_backend.py` dense replay 路径中使用 `req_indices=None`。
+
+复测路径：
+
+```text
+/mnt/cpfs/zyj/casual_spec/bench_outputs/dflash_mamba_replay_20260611/correctness_seq_len_patch_k1
+```
+
+结果：`K=1` 与 `K=16` 仍未 exact-output 对齐，4/4 prompt mismatch；部分 prompt 的 `spec_accept_length` 也继续偏离。因此该最小迁移不足以解决当前 upstream 基线上的 partial-K CUDA graph/post-verify state update 问题，未提交代码改动。
 
 ## Artifact 路径
 
