@@ -94,11 +94,14 @@ class ModelRunnerKVCacheMixin:
         intermediate_cache_per_req = 0
         if has_spec_dec:
             draft_tokens = int(server_args.max_speculative_num_draft_tokens)
-            mamba_cache_steps = (
-                draft_tokens
-                if server_args.speculative_dflash_mamba_cache_steps is None
-                else int(server_args.speculative_dflash_mamba_cache_steps)
-            )
+            mamba_cache_steps = draft_tokens
+            if (
+                self.spec_algorithm.is_dflash()
+                and server_args.speculative_dflash_mamba_cache_steps is not None
+            ):
+                mamba_cache_steps = int(
+                    server_args.speculative_dflash_mamba_cache_steps
+                )
             intermediate_cache_per_req = (
                 global_params.mamba_conv_cache_per_req * draft_tokens
                 + global_params.mamba_temporal_cache_per_req * mamba_cache_steps
@@ -338,6 +341,8 @@ class ModelRunnerKVCacheMixin:
                         speculative_num_draft_tokens=max_spec_draft_tokens,
                         speculative_mamba_cache_steps=(
                             self.server_args.speculative_dflash_mamba_cache_steps
+                            if self.spec_algorithm.is_dflash()
+                            else None
                         ),
                         enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
                         pre_alloc_size=pre_alloc_size,
@@ -376,6 +381,8 @@ class ModelRunnerKVCacheMixin:
                     speculative_num_draft_tokens=max_spec_draft_tokens,
                     speculative_mamba_cache_steps=(
                         self.server_args.speculative_dflash_mamba_cache_steps
+                        if self.spec_algorithm.is_dflash()
+                        else None
                     ),
                     enable_overlap_schedule=not self.server_args.disable_overlap_schedule,
                     start_layer=self.start_layer,

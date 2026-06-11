@@ -76,6 +76,18 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
             device=self.device,
         )
 
+    @staticmethod
+    def _spec_metadata_kwargs(
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+    ):
+        return dict(
+            is_target_verify=forward_mode.is_target_verify(),
+            draft_token_num=(spec_info.draft_token_num if spec_info is not None else 1),
+            mamba_cache_steps=getattr(spec_info, "mamba_cache_steps", None),
+            mamba_replay=bool(getattr(spec_info, "mamba_replay", False)),
+        )
+
     def _capture_metadata(
         self,
         bs: int,
@@ -115,12 +127,14 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                **self._spec_metadata_kwargs(forward_mode, spec_info),
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                **self._spec_metadata_kwargs(forward_mode, spec_info),
             )
 
     def _replay_metadata(
@@ -191,12 +205,14 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
+                **self._spec_metadata_kwargs(forward_mode, spec_info),
             )
         else:
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
                 mamba_cache_indices_gdn=self.state_indices_list_gdn[bs - 1],
+                **self._spec_metadata_kwargs(forward_mode, spec_info),
             )
 
     def get_cuda_graph_seq_len_fill_value(self):

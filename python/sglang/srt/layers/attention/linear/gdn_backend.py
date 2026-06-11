@@ -313,6 +313,8 @@ class GDNKernelDispatcher:
 class GDNAttnBackend(MambaAttnBackendBase):
     """Attention backend for GDN (Gated Delta Network) linear attention."""
 
+    supports_dflash_mamba_replay = True
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.conv_states_shape = (
@@ -330,9 +332,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
             self.req_to_token_pool.size, dtype=torch.int32, device=model_runner.device
         )
         self._verify_replay_inputs = {}
-        self._verify_replay_inputs_by_graph_bs = {}
+        self._verify_replay_inputs_by_graph_key = {}
         self._verify_replay_inputs_graph_static = False
-        self._verify_replay_graph_bs = None
+        self._verify_replay_graph_key = None
         self._replay_req_indices_cache: Dict[Tuple[str, int, int], torch.Tensor] = {}
         self._replay_tail_lengths_cache: Dict[Tuple[str, int, int], torch.Tensor] = {}
         self._replay_invalid_mask_cache: Dict[Tuple[str, int, int], torch.Tensor] = {}
@@ -378,7 +380,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
-        self._verify_replay_graph_bs = None
+        self._verify_replay_graph_key = None
         if (
             forward_batch.forward_mode.is_target_verify()
             and not self._verify_replay_inputs_graph_static
@@ -400,13 +402,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         in_capture: bool = False,
     ):
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
-        self._verify_replay_graph_bs = None
+        self._verify_replay_graph_key = None
         if not forward_batch.forward_mode.is_target_verify():
             return
         if in_capture:
             return
         if self._verify_replay_inputs_graph_static:
-            self._verify_replay_graph_bs = forward_batch.batch_size
+            self._verify_replay_graph_key = getattr(
+                forward_batch, "cuda_graph_key", forward_batch.batch_size
+            )
         else:
             self._verify_replay_inputs.clear()
 
@@ -429,7 +433,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             forward_mode,
             spec_info,
         )
-        self._verify_replay_graph_bs = None
+        self._verify_replay_graph_key = None
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -452,7 +456,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             spec_info,
             seq_lens_cpu,
         )
-        self._verify_replay_graph_bs = bs if forward_mode.is_target_verify() else None
+        self._verify_replay_graph_key = bs if forward_mode.is_target_verify() else None
 
     def forward_decode(
         self,
@@ -651,7 +655,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     and torch.cuda.is_current_stream_capturing()
                 ):
                     self._verify_replay_inputs_graph_static = True
-                    self._verify_replay_inputs_by_graph_bs.setdefault(batch_size, {})[
+                    graph_key = getattr(forward_batch, "cuda_graph_key", batch_size)
+                    self._verify_replay_inputs_by_graph_key.setdefault(graph_key, {})[
                         layer.layer_id
                     ] = replay_inputs
                 else:
@@ -730,9 +735,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         should read from one cache slot and write the final state to another.
         """
         replay_inputs_by_layer = self._verify_replay_inputs
-        if self._verify_replay_graph_bs is not None:
-            replay_inputs_by_layer = self._verify_replay_inputs_by_graph_bs.get(
-                self._verify_replay_graph_bs, {}
+        if self._verify_replay_graph_key is not None:
+            replay_inputs_by_layer = self._verify_replay_inputs_by_graph_key.get(
+                self._verify_replay_graph_key, {}
             )
 
         if not replay_inputs_by_layer:
@@ -845,6 +850,6 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def clear_mamba_replay_inputs(self) -> None:
         if self._verify_replay_inputs_graph_static:
-            self._verify_replay_graph_bs = None
+            self._verify_replay_graph_key = None
             return
         self._verify_replay_inputs.clear()

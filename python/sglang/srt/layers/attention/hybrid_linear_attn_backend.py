@@ -129,6 +129,8 @@ def track_mamba_states_if_needed(
 
 
 class MambaAttnBackendBase(AttentionBackend):
+    supports_dflash_mamba_replay = False
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
@@ -146,6 +148,15 @@ class MambaAttnBackendBase(AttentionBackend):
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
         self.conv_states_shape: tuple[int, int] = None
+
+    def replay_mamba_state_after_verify(self, **kwargs) -> None:
+        raise NotImplementedError(
+            "DFLASH reduced Mamba cache replay is only implemented for GDN "
+            "linear attention backends."
+        )
+
+    def clear_mamba_replay_inputs(self) -> None:
+        pass
 
     def _execute_deferred_mamba_cow_and_clear(self, forward_batch: ForwardBatch):
         """Run deferred clear/COW ops on the forward stream to avoid races."""
@@ -1110,6 +1121,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         zero_cache_replay = replay_enabled and effective_cache_steps == 0
         dense_active_replay = replay_enabled and effective_cache_steps <= 1
 
+        if replay_enabled and not self.linear_attn_backend.supports_dflash_mamba_replay:
+            raise NotImplementedError(
+                "DFLASH reduced Mamba cache replay is only implemented for GDN "
+                "linear attention backends."
+            )
+
         if replay_enabled:
             replay_start_step = effective_cache_steps - 1
             if zero_cache_replay:
@@ -1141,18 +1158,9 @@ class HybridLinearAttnBackend(AttentionBackend):
             accepted_steps,
         )
 
-        # Replay remaining SSM steps beyond what was cached
-        if replay_enabled:
-            self.linear_attn_backend.replay_mamba_state_after_verify(
-                target_steps=accepted_steps,
-                target_lengths=accepted_lengths if zero_cache_replay else None,
-                destination_state_indices=state_indices_tensor,
-                mamba_cache_steps=effective_cache_steps,
-                replay_all_requests=dense_active_replay,
-            )
+        tracked_mamba_state_updated = False
 
-        # Track indices used for tracking mamba states for prefix cache
-        if mamba_track_indices is not None:
+        def update_tracked_mamba_state_after_verify():
             assert mamba_steps_to_track is not None
             if zero_cache_replay:
                 ssm_steps_to_track = mamba_steps_to_track
@@ -1186,6 +1194,27 @@ class HybridLinearAttnBackend(AttentionBackend):
                         state_indices_tensor if zero_cache_replay else None
                     ),
                 )
+
+        # K=0 replay must compute prefix-cache tracking slots before the main
+        # request slots are replayed, because the main slots hold the pre-verify
+        # initial states.
+        if zero_cache_replay and mamba_track_indices is not None:
+            update_tracked_mamba_state_after_verify()
+            tracked_mamba_state_updated = True
+
+        # Replay remaining SSM steps beyond what was cached
+        if replay_enabled:
+            self.linear_attn_backend.replay_mamba_state_after_verify(
+                target_steps=accepted_steps,
+                target_lengths=accepted_lengths if zero_cache_replay else None,
+                destination_state_indices=state_indices_tensor,
+                mamba_cache_steps=effective_cache_steps,
+                replay_all_requests=dense_active_replay,
+            )
+
+        # Track indices used for tracking mamba states for prefix cache
+        if mamba_track_indices is not None and not tracked_mamba_state_updated:
+            update_tracked_mamba_state_after_verify()
 
         if replay_enabled:
             self.linear_attn_backend.clear_mamba_replay_inputs()

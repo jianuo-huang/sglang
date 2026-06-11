@@ -589,6 +589,17 @@ class TestDFlashMambaReplayArgs(CustomTestCase):
 
         self.assertIn("must be <=", str(context.exception))
 
+    def test_mamba_cache_steps_requires_dflash(self):
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = "EAGLE"
+        args.speculative_dflash_mamba_cache_steps = 0
+        args.device = "cuda"
+
+        with self.assertRaises(ValueError) as context:
+            handle_speculative_decoding(args)
+
+        self.assertIn("only supported", str(context.exception))
+
     def test_draft_window_must_cover_dflash_block(self):
         args = self._make_dummy_dflash_args(
             speculative_draft_window_size=8,

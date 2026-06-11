@@ -92,6 +92,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
                 server_args.speculative_algorithm,
             )
 
+    if (
+        server_args.speculative_dflash_mamba_cache_steps is not None
+        and server_args.speculative_algorithm != "DFLASH"
+    ):
+        raise ValueError(
+            "--speculative-dflash-mamba-cache-steps is only supported with "
+            "--speculative-algorithm DFLASH."
+        )
+
     if server_args.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
