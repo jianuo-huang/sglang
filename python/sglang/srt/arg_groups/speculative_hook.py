@@ -92,6 +92,15 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
                 server_args.speculative_algorithm,
             )
 
+    if (
+        server_args.speculative_dflash_mamba_cache_steps is not None
+        and server_args.speculative_algorithm != "DFLASH"
+    ):
+        raise ValueError(
+            "--speculative-dflash-mamba-cache-steps is only supported with "
+            "--speculative-algorithm DFLASH."
+        )
+
     if server_args.speculative_algorithm is not None:
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
         from sglang.srt.speculative.spec_registry import CustomSpecAlgo
@@ -108,6 +117,11 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
             f"speculative_algorithm == EAGLE, got {server_args.speculative_algorithm}."
         )
 
+    if server_args.speculative_adaptive:
+        _maybe_disable_adaptive(server_args)
+        if server_args.speculative_adaptive:
+            _init_adaptive_speculative_params(server_args)
+
     if server_args.speculative_algorithm == "DFLASH":
         _handle_dflash(server_args)
     elif server_args.speculative_algorithm == "FROZEN_KV_MTP":
@@ -116,18 +130,6 @@ def handle_speculative_decoding(server_args: "ServerArgs") -> None:
         _handle_eagle_family(server_args)
     elif server_args.speculative_algorithm == "NGRAM":
         _handle_ngram(server_args)
-
-    if server_args.speculative_adaptive:
-        _maybe_disable_adaptive(server_args)
-        if server_args.speculative_adaptive:
-            from sglang.srt.speculative.adaptive_spec_params import (
-                validate_adaptive_initial_steps,
-            )
-
-            validate_adaptive_initial_steps(
-                server_args.speculative_num_steps,
-                server_args.speculative_adaptive_config,
-            )
 
 
 def _handle_dflash(server_args: "ServerArgs") -> None:
@@ -230,6 +232,29 @@ def _handle_dflash(server_args: "ServerArgs") -> None:
                 "--speculative-num-draft-tokens (block_size). "
                 f"window_size={server_args.speculative_draft_window_size}, block_size={draft_tokens}."
             )
+
+    if server_args.speculative_dflash_mamba_cache_steps is not None:
+        cache_steps = int(server_args.speculative_dflash_mamba_cache_steps)
+        draft_tokens = int(server_args.speculative_num_draft_tokens)
+        if cache_steps < 0:
+            raise ValueError(
+                "DFLASH requires --speculative-dflash-mamba-cache-steps "
+                f"to be non-negative, got {cache_steps}."
+            )
+        if cache_steps > draft_tokens:
+            raise ValueError(
+                "DFLASH --speculative-dflash-mamba-cache-steps must be <= "
+                "--speculative-num-draft-tokens. "
+                f"cache_steps={cache_steps}, draft_tokens={draft_tokens}."
+            )
+        server_args.speculative_dflash_mamba_cache_steps = cache_steps
+
+    if (
+        server_args.speculative_dflash_mamba_cache_steps is not None
+        and server_args.speculative_dflash_mamba_cache_steps
+        < server_args.speculative_num_draft_tokens
+    ):
+        server_args.speculative_dflash_mamba_replay = True
 
     if server_args.max_running_requests is None:
         server_args.max_running_requests = 48
@@ -340,18 +365,20 @@ def _handle_eagle_family(server_args: "ServerArgs") -> None:
                     "DeepSeek MTP does not require setting speculative_draft_model_path."
                 )
 
-    if server_args.speculative_num_steps is None:
+    if (
+        not server_args.speculative_adaptive
+        and server_args.speculative_num_steps is None
+    ):
         assert (
             server_args.speculative_eagle_topk is None
             and server_args.speculative_num_draft_tokens is None
         )
-        from sglang.srt.server_args import auto_choose_speculative_params
 
         (
             server_args.speculative_num_steps,
             server_args.speculative_eagle_topk,
             server_args.speculative_num_draft_tokens,
-        ) = auto_choose_speculative_params(server_args)
+        ) = _auto_choose_speculative_params(server_args, model_arch)
 
     if (
         server_args.attention_backend == "trtllm_mha"
@@ -466,3 +493,63 @@ def _maybe_disable_adaptive(server_args: "ServerArgs") -> None:
             "Falling back to static speculative params."
         )
         server_args.speculative_adaptive = False
+
+
+def _init_adaptive_speculative_params(server_args: "ServerArgs") -> None:
+    from sglang.srt.speculative.adaptive_spec_params import (
+        resolve_candidate_steps_from_config,
+    )
+
+    candidate_steps = resolve_candidate_steps_from_config(
+        cfg_path=server_args.speculative_adaptive_config,
+    )
+
+    if server_args.speculative_eagle_topk is None:
+        server_args.speculative_eagle_topk = 1
+
+    if server_args.speculative_num_steps is None:
+        server_args.speculative_num_steps = candidate_steps[len(candidate_steps) // 2]
+
+    if server_args.speculative_num_steps not in candidate_steps:
+        raise ValueError(
+            f"--speculative-num-steps={server_args.speculative_num_steps} "
+            f"is not in the adaptive config candidate_steps {candidate_steps}. "
+            "Pass one of those values."
+        )
+
+    server_args.speculative_num_draft_tokens = server_args.speculative_num_steps + 1
+
+
+def _auto_choose_speculative_params(
+    server_args: "ServerArgs", model_arch: str
+) -> tuple:
+    """
+    Automatically choose the parameters for speculative decoding.
+
+    You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
+    """
+    if server_args.speculative_algorithm == "STANDALONE":
+        return (3, 1, 4)
+    if model_arch in ["LlamaForCausalLM"]:
+        return (5, 4, 8)
+    elif model_arch in [
+        "DeepseekV32ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV2ForCausalLM",
+        "GptOssForCausalLM",
+        "Glm4MoeForCausalLM",
+        "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
+        "BailingMoeForCausalLM",
+        "BailingMoeV2ForCausalLM",
+        "BailingMoeV2_5ForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "PixtralForConditionalGeneration",
+        "MiMoV2ForCausalLM",
+        "MiMoV2FlashForCausalLM",
+    ]:
+        return (3, 1, 4)
+    elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
+        return (5, 4, 8)
+    else:
+        return (3, 1, 4)

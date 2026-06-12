@@ -617,6 +617,8 @@ class ServerArgs:
     speculative_eagle_topk: Optional[int] = None
     speculative_num_draft_tokens: Optional[int] = None
     speculative_dflash_block_size: Optional[int] = None
+    speculative_dflash_mamba_cache_steps: Optional[int] = None
+    speculative_dflash_mamba_replay: bool = False
     speculative_accept_threshold_single: float = 1.0
     speculative_accept_threshold_acc: float = 1.0
     speculative_token_map: Optional[str] = None
@@ -6067,6 +6069,15 @@ class ServerArgs:
             default=ServerArgs.speculative_dflash_block_size,
         )
         parser.add_argument(
+            "--speculative-dflash-mamba-cache-steps",
+            type=int,
+            help="DFLASH only. Number of target-verify draft steps whose intermediate "
+            "Mamba/GDN SSM states are cached. Defaults to the full verify block size. "
+            "Values smaller than the block size reduce speculative SSM cache memory "
+            "and automatically replay the uncached accepted tail.",
+            default=ServerArgs.speculative_dflash_mamba_cache_steps,
+        )
+        parser.add_argument(
             "--speculative-accept-threshold-single",
             type=float,
             help="Accept a draft token if its probability in the target model is greater than this threshold.",
@@ -8448,41 +8459,3 @@ class PortArgs:
                 ).to_tcp(),
                 instance_id=instance_id,
             )
-
-
-def auto_choose_speculative_params(self: ServerArgs):
-    """
-    Automatically choose the parameters for speculative decoding.
-
-    You can tune them on your own models and prompts with scripts/playground/bench_speculative.py
-    """
-    hf_config = self.get_model_config().hf_config
-    arch = hf_config.architectures[0]
-    if self.speculative_algorithm == "STANDALONE":
-        # The default value for standalone speculative decoding
-        return (3, 1, 4)
-    if arch in ["LlamaForCausalLM"]:
-        # The default value for llama
-        return (5, 4, 8)
-    elif arch in [
-        "DeepseekV32ForCausalLM",
-        "DeepseekV3ForCausalLM",
-        "DeepseekV2ForCausalLM",
-        "GptOssForCausalLM",
-        "Glm4MoeForCausalLM",
-        "Glm4MoeLiteForCausalLM",
-        "GlmMoeDsaForCausalLM",
-        "BailingMoeForCausalLM",
-        "BailingMoeV2ForCausalLM",
-        "BailingMoeV2_5ForCausalLM",
-        "MistralLarge3ForCausalLM",
-        "PixtralForConditionalGeneration",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
-    ]:
-        return (3, 1, 4)
-    elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
-        return (5, 4, 8)
-    else:
-        # The default value for all other models
-        return (3, 1, 4)

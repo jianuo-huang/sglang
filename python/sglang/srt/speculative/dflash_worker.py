@@ -218,6 +218,8 @@ class DFlashWorker:
             draft_token=torch.empty((0,), dtype=torch.long, device=self.device),
             positions=torch.empty((0,), dtype=torch.int64, device=self.device),
             draft_token_num=int(self.block_size),
+            mamba_cache_steps=server_args.speculative_dflash_mamba_cache_steps,
+            mamba_replay=server_args.speculative_dflash_mamba_replay,
             custom_mask=None,
             capture_hidden_mode=CaptureHiddenMode.NULL,
         )
@@ -680,6 +682,8 @@ class DFlashWorker:
             draft_token=draft_tokens.reshape(-1),
             positions=positions,
             draft_token_num=self.block_size,
+            mamba_cache_steps=self.server_args.speculative_dflash_mamba_cache_steps,
+            mamba_replay=self.server_args.speculative_dflash_mamba_replay,
         )
         _, build_custom_mask = resolve_dflash_verify_mask_policy(
             self.model_runner.attn_backend
@@ -1070,6 +1074,7 @@ class DFlashWorker:
         *,
         batch: ScheduleBatch,
         seq_lens_pre_verify: torch.Tensor,
+        seq_lens_cpu_pre_verify: Optional[torch.Tensor],
         commit_lens: torch.Tensor,
     ) -> None:
         """Commit Mamba intermediate states for accepted verify steps.
@@ -1082,33 +1087,62 @@ class DFlashWorker:
         if not hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
             return
 
-        last_correct_step_indices = commit_lens.to(torch.int64) - 1
+        accepted_steps = commit_lens.to(torch.int32) - 1
+        mamba_track_indices = batch.mamba_track_indices
         mamba_steps_to_track = None
 
-        if batch.mamba_track_indices is not None:
+        if mamba_track_indices is not None:
             mamba_track_interval = self.server_args.mamba_track_interval
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != batch.seq_lens // mamba_track_interval
-            )
-            tracking_point = (
-                batch.seq_lens // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
-            )
-            mamba_steps_to_track = torch.where(
-                can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
+            if seq_lens_cpu_pre_verify is not None:
+                seq_lens_cpu = batch.seq_lens_cpu
+                commit_lens_cpu = seq_lens_cpu - seq_lens_cpu_pre_verify
+                to_track_mask_cpu = (
+                    seq_lens_cpu_pre_verify // mamba_track_interval
+                    != seq_lens_cpu // mamba_track_interval
+                )
+                tracking_point_cpu = (
+                    seq_lens_cpu // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith_cpu = torch.clamp(
+                    tracking_point_cpu - seq_lens_cpu_pre_verify - 1, min=0
+                )
+                can_track_mask_cpu = to_track_mask_cpu & (
+                    to_track_ith_cpu < commit_lens_cpu.to(to_track_ith_cpu.dtype)
+                )
+                if bool(can_track_mask_cpu.any().item()):
+                    mamba_steps_to_track = torch.where(
+                        can_track_mask_cpu,
+                        to_track_ith_cpu.to(torch.int32),
+                        torch.full_like(to_track_ith_cpu, -1, dtype=torch.int32),
+                    ).to(device=batch.seq_lens.device, non_blocking=True)
+                else:
+                    mamba_track_indices = None
+            else:
+                to_track_mask = (
+                    seq_lens_pre_verify // mamba_track_interval
+                    != batch.seq_lens // mamba_track_interval
+                )
+                tracking_point = (
+                    batch.seq_lens // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                )
+                can_track_mask = to_track_mask & (
+                    to_track_ith < commit_lens.to(to_track_ith.dtype)
+                )
+                mamba_steps_to_track = torch.where(
+                    can_track_mask,
+                    to_track_ith.to(torch.int32),
+                    torch.full_like(to_track_ith, -1, dtype=torch.int32),
+                )
 
         attn_backend.update_mamba_state_after_mtp_verify(
-            last_correct_step_indices=last_correct_step_indices,
-            mamba_track_indices=batch.mamba_track_indices,
+            accepted_steps=accepted_steps,
+            mamba_track_indices=mamba_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             model=self.target_worker.model_runner.model,
+            accepted_lengths=commit_lens,
         )
 
     def forward_batch_generation(
@@ -1189,6 +1223,11 @@ class DFlashWorker:
         seq_lens_pre_verify = (
             batch.seq_lens.clone() if need_mamba_verify_commit else None
         )
+        seq_lens_cpu_pre_verify = (
+            batch.seq_lens_cpu.clone()
+            if need_mamba_verify_commit and batch.mamba_track_indices is not None
+            else None
+        )
 
         batch_result = self.target_worker.forward_batch_generation(
             batch, is_verify=True, **kwargs
@@ -1213,6 +1252,7 @@ class DFlashWorker:
             self._update_target_mamba_state_after_verify(
                 batch=batch,
                 seq_lens_pre_verify=seq_lens_pre_verify,
+                seq_lens_cpu_pre_verify=seq_lens_cpu_pre_verify,
                 commit_lens=commit_lens,
             )
 
