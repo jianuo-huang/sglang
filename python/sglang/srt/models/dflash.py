@@ -32,6 +32,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
     get_dflash_layer_types,
+    is_dflash_domino_projector,
     parse_dflash_draft_config,
 )
 from sglang.srt.utils import is_npu
@@ -371,6 +372,43 @@ class DFlashDraftModel(nn.Module):
 
         self.block_size = draft_config.resolve_block_size(default=16)
 
+        # Optional Domino projector (GRU prefix encoder + MLP that emits a per-step
+        # bias on top of the target lm_head logits). Older checkpoints used
+        # projector_type=causal_v5; public checkpoints use projector_type=domino.
+        self.projector_type: Optional[str] = draft_config.projector_type
+        self.pure_draft_prefix_len: int = int(draft_config.pure_draft_prefix_len)
+        self.shift_label: bool = bool(draft_config.shift_label)
+        self.gru_hidden_dim: Optional[int] = draft_config.gru_hidden_dim
+        self.emb_dim: Optional[int] = draft_config.emb_dim
+
+        if is_dflash_domino_projector(self.projector_type):
+            if self.gru_hidden_dim is None or self.emb_dim is None:
+                raise ValueError(
+                    "DFLASH Domino requires gru_hidden_dim and emb_dim. "
+                    f"gru_hidden_dim={self.gru_hidden_dim}, emb_dim={self.emb_dim}."
+                )
+            vocab_size = int(getattr(config, "vocab_size", 0))
+            if vocab_size <= 0:
+                raise ValueError(
+                    f"DFLASH Domino requires positive vocab_size, got {vocab_size}."
+                )
+            self.prefix_gru = nn.GRU(
+                input_size=hidden_size,
+                hidden_size=int(self.gru_hidden_dim),
+                num_layers=1,
+                batch_first=True,
+                bias=False,
+            )
+            self.embed_proj = nn.Sequential(
+                nn.Linear(
+                    hidden_size + int(self.gru_hidden_dim),
+                    int(self.emb_dim),
+                    bias=False,
+                ),
+                nn.SiLU(),
+                nn.Linear(int(self.emb_dim), vocab_size, bias=False),
+            )
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
         return get_dflash_attention_sliding_window_size(self.config)
 
@@ -437,6 +475,7 @@ class DFlashDraftModel(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        loaded_domino_params = set()
 
         def resolve_param_name(name: str) -> Optional[str]:
             if name in params_dict:
@@ -462,6 +501,8 @@ class DFlashDraftModel(nn.Module):
                 param = params_dict[resolved_name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight, shard_id)
+                if resolved_name.startswith(("prefix_gru.", "embed_proj.")):
+                    loaded_domino_params.add(resolved_name)
                 break
             else:
                 resolved_name = resolve_param_name(name)
@@ -481,6 +522,33 @@ class DFlashDraftModel(nn.Module):
                     )
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if resolved_name.startswith(("prefix_gru.", "embed_proj.")):
+                    loaded_domino_params.add(resolved_name)
+
+        if (
+            hasattr(self, "prefix_gru")
+            and self.prefix_gru is not None
+            and not getattr(self, "_domino_projector_weights_loaded", False)
+        ):
+            expected_domino_params = {
+                name
+                for name in params_dict
+                if name.startswith(("prefix_gru.", "embed_proj."))
+            }
+            missing_domino_params = expected_domino_params - loaded_domino_params
+            if missing_domino_params:
+                raise ValueError(
+                    "DFLASH Domino checkpoint is missing required projector weights: "
+                    f"{sorted(missing_domino_params)}."
+                )
+
+        self.post_load_weights()
+
+    def post_load_weights(self) -> None:
+        """Finalize weights loaded through either model or bypass loaders."""
+        if hasattr(self, "prefix_gru") and self.prefix_gru is not None:
+            self._domino_projector_weights_loaded = True
+            self.prefix_gru.flatten_parameters()
 
 
 class DFlashLagunaAttention(DFlashAttention):

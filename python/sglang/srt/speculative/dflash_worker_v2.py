@@ -32,6 +32,7 @@ from sglang.srt.speculative.dflash_utils import (
     can_dflash_use_fused_qkv_proj,
     compute_dflash_correct_drafts_and_bonus,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    is_dflash_domino_projector,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
 )
@@ -42,6 +43,7 @@ from sglang.srt.speculative.draft_worker_common import (
     make_draft_input_v2,
     make_draft_sampler_capture_hook,
 )
+from sglang.srt.speculative.domino_rollout import DFlashDominoRollout
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 from sglang.srt.utils import get_available_gpu_memory, is_cuda, is_hip, is_npu
@@ -164,6 +166,36 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.speculative_num_draft_tokens = int(self.block_size)
+
+        # Optional Domino projector rollout. Only created when the draft model
+        # carries a Domino projector; ordinary DFLASH draft selection is left
+        # untouched. The rollout owns the Domino-specific draft-token generation
+        # with the checkpoint's eager reference math and currently supports
+        # TP=1 only.
+        self._is_domino = is_dflash_domino_projector(
+            getattr(self.draft_model, "projector_type", None)
+        )
+        if self._is_domino:
+            # Fail early (at server init) for unsupported parallelism instead of
+            # raising deep inside the first decode step. The selected draft token
+            # feeds the next GRU step, so TP>1 would need per-step cross-rank
+            # synchronization that this first port does not implement.
+            domino_tp_size = int(get_tp_group().world_size)
+            if domino_tp_size != 1:
+                raise NotImplementedError(
+                    "DFLASH Domino projector currently supports TP=1 only, got "
+                    f"tp_size={domino_tp_size}. Launch with --tp-size 1 "
+                    "(alias --tensor-parallel-size 1), or use a non-Domino DFLASH "
+                    "draft model for TP>1."
+                )
+        self.domino_rollout: Optional[DFlashDominoRollout] = (
+            DFlashDominoRollout(
+                draft_model=self.draft_model,
+                block_size=self.block_size,
+            )
+            if self._is_domino
+            else None
+        )
 
         self._mask_token = draft_config.mask_token
         self._mask_token_id_override = draft_config.mask_token_id
@@ -307,6 +339,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         if get_tp_group().world_size != 1:
             return _eager("tp>1")
+        if self._is_domino:
+            # Domino performs sequential GRU-conditioned full-vocabulary
+            # sampling in DFlashDominoRollout. The ordinary DFLASH sampler
+            # would ignore the Domino bias and must not be captured.
+            return _eager("Domino projector uses its own rollout")
         if self.block_size <= 1:
             return _eager("block_size<=1")
         target_model = self._target_worker.model_runner.model
@@ -1479,7 +1516,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if self._draft_sampler is not None and draft_out.can_run_graph:
+        if self._is_domino:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DFLASH draft model returned no hidden states.")
+            draft_hidden = draft_hidden.view(bs, int(self.block_size), -1)
+            if self.domino_rollout is None:
+                raise RuntimeError(
+                    "DFLASH Domino projector requires an initialized Domino rollout."
+                )
+            draft_next = self.domino_rollout.rollout_draft_block(
+                draft_hidden=draft_hidden,
+                verified_id=block_ids[:, 0],
+                target_model=target_model,
+                lm_head=lm_head,
+            )
+        elif self._draft_sampler is not None and draft_out.can_run_graph:
             draft_next = self._draft_sampler.out[
                 : bs * (int(self.block_size) - 1)
             ].view(bs, int(self.block_size) - 1)
