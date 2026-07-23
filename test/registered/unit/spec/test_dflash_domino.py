@@ -7,11 +7,17 @@ import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.models.dflash import DFlashDraftModel
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_utils import (
+    compute_dflash_correct_drafts_and_bonus,
+    parse_dflash_draft_config,
+    select_dflash_verify_prefix,
+)
 from sglang.srt.speculative.domino_utils import (
     domino_greedy_rollout,
     validate_domino_runtime,
 )
+from sglang.srt.speculative.draft_worker_common import build_draft_tp_worker
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -124,6 +130,91 @@ class TestDFlashDominoConfig(CustomTestCase):
     def test_conflicting_emb_dim_fails(self):
         with self.assertRaisesRegex(ValueError, "emb_dim differs"):
             parse_dflash_draft_config(draft_hf_config=_domino_config(emb_dim=6))
+
+
+class TestDFlashVerifyPrefix(CustomTestCase):
+    def test_prefix_is_selected_per_request(self):
+        dense = torch.arange(3 * 16).view(3, 16)
+
+        for verify_width in (1, 4, 8, 16):
+            with self.subTest(verify_width=verify_width):
+                prefix = select_dflash_verify_prefix(dense, verify_width=verify_width)
+                self.assertEqual(prefix.shape, (3, verify_width))
+                self.assertTrue(prefix.is_contiguous())
+                torch.testing.assert_close(prefix, dense[:, :verify_width])
+                torch.testing.assert_close(
+                    prefix.reshape(-1),
+                    torch.cat([row[:verify_width] for row in dense]),
+                )
+
+    def test_acceptance_is_capped_by_verify_width(self):
+        candidates = torch.tensor(
+            [
+                [10, 11, 12, 13, 14, 15, 16, 17],
+                [20, 21, 22, 23, 24, 25, 26, 27],
+            ]
+        )
+        target_predict = torch.tensor(
+            [
+                [11, 12, 13, 99, 15, 16, 17, 18],
+                [21, 22, 23, 24, 25, 26, 27, 28],
+            ]
+        )
+        full_correct, _ = compute_dflash_correct_drafts_and_bonus(
+            candidates=candidates,
+            target_predict=target_predict,
+        )
+
+        for verify_width in (1, 4, 8):
+            with self.subTest(verify_width=verify_width):
+                correct_drafts, _ = compute_dflash_correct_drafts_and_bonus(
+                    candidates=select_dflash_verify_prefix(
+                        candidates, verify_width=verify_width
+                    ),
+                    target_predict=select_dflash_verify_prefix(
+                        target_predict, verify_width=verify_width
+                    ),
+                )
+                expected = torch.minimum(
+                    full_correct,
+                    torch.full_like(full_correct, verify_width - 1),
+                )
+                torch.testing.assert_close(correct_drafts, expected)
+
+
+class TestDFlashDraftWorkerConfig(CustomTestCase):
+    def test_draft_worker_uses_full_block_width(self):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.speculative_num_draft_tokens = 4
+        server_args.speculative_draft_attention_backend = "triton"
+        draft_runner = mock.MagicMock()
+        draft_runner.model = mock.MagicMock()
+        draft_worker = mock.MagicMock(model_runner=draft_runner)
+
+        with (
+            mock.patch(
+                "sglang.srt.speculative.draft_worker_common.TpModelWorker",
+                return_value=draft_worker,
+            ) as tp_worker,
+            mock.patch(
+                "sglang.srt.speculative.draft_worker_common.get_server_args",
+                return_value=server_args,
+            ),
+            mock.patch("sglang.srt.speculative.draft_worker_common.get_context"),
+        ):
+            build_draft_tp_worker(
+                server_args=server_args,
+                gpu_id=0,
+                ps=SimpleNamespace(),
+                nccl_port=1234,
+                target_model_config=SimpleNamespace(context_len=4096),
+                algo_label="DFLASH",
+                num_draft_tokens_override=16,
+            )
+
+        draft_server_args = tp_worker.call_args.kwargs["server_args"]
+        self.assertEqual(server_args.speculative_num_draft_tokens, 4)
+        self.assertEqual(draft_server_args.speculative_num_draft_tokens, 16)
 
 
 class TestDFlashDominoWeights(CustomTestCase):

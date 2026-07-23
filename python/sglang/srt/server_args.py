@@ -1740,7 +1740,7 @@ class ServerArgs:
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        "DFLASH only. Draft-model block size. Set this together with --speculative-num-draft-tokens to use a shorter target verify width; if omitted, the legacy num-draft-tokens alias or draft model config determines the block size.",
     ] = None
     speculative_domino_candidate_pool_size: A[
         int,
@@ -4048,7 +4048,7 @@ class ServerArgs:
                         or decode_cuda_graph_config.max_bs
                         or 1
                     )
-                    draft_tokens = self.speculative_num_draft_tokens or 1
+                    draft_tokens = self.max_speculative_num_draft_tokens or 1
                     activation_tokens = max(running_requests * draft_tokens, 2048)
                 elif self.chunked_prefill_size > 0:
                     activation_tokens = max(self.chunked_prefill_size, 2048)
@@ -4131,7 +4131,8 @@ class ServerArgs:
                 self.max_running_requests or self.cuda_graph_config.decode.max_bs or 1
             )
             activation_tokens = max(
-                running_requests * (self.speculative_num_draft_tokens or 1), 2048
+                running_requests * (self.max_speculative_num_draft_tokens or 1),
+                2048,
             )
         elif self.chunked_prefill_size > 0:
             activation_tokens = max(self.chunked_prefill_size, 2048)
@@ -7570,6 +7571,17 @@ class ServerArgs:
         """Return the maximum draft-token count speculative decoding may use."""
         if self.speculative_num_draft_tokens is None:
             return None
+        if self.speculative_algorithm is not None:
+            from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+            if (
+                SpeculativeAlgorithm.from_string(self.speculative_algorithm).is_dflash()
+                and self.speculative_dflash_block_size is not None
+            ):
+                return max(
+                    self.speculative_num_draft_tokens,
+                    self.speculative_dflash_block_size,
+                )
         if not self.speculative_adaptive:
             return self.speculative_num_draft_tokens
 

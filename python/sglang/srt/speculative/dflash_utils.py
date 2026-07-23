@@ -55,6 +55,21 @@ def is_dflash_sampling_verify_available() -> bool:
     return _DFLASH_SAMPLING_VERIFY_AVAILABLE
 
 
+def select_dflash_verify_prefix(
+    tensor: torch.Tensor, *, verify_width: int
+) -> torch.Tensor:
+    """Select a per-request prefix from a dense DFLASH draft block."""
+    if tensor.ndim != 2:
+        raise ValueError(
+            f"DFLASH verify prefix requires a 2D tensor, got {tensor.ndim}D."
+        )
+    if not 0 < verify_width <= tensor.shape[1]:
+        raise ValueError(
+            f"DFLASH verify_width must be in [1, {tensor.shape[1]}], got {verify_width}."
+        )
+    return tensor[:, :verify_width].contiguous()
+
+
 def scale_kv_cell_size_per_token_for_dflash(
     *,
     target_cell_size_per_token: int,

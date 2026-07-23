@@ -431,9 +431,7 @@ class KVCacheConfigurator:
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
         mamba_layer_ids = [
             i
@@ -501,9 +499,7 @@ class KVCacheConfigurator:
             not self.use_mla_backend
         ), "unified memory pool does not support MLA-SWA hybrid yet"
         # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
         req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
