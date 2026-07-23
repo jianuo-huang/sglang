@@ -431,9 +431,7 @@ class KVCacheConfigurator:
         # the mamba sub-pool stays page=1.
         assert self.page_size >= 1, f"page_size must be >= 1, got {self.page_size}"
         # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
 
         mamba_layer_ids = [
             i
@@ -466,7 +464,7 @@ class KVCacheConfigurator:
             max_num_reqs=max_num_reqs,
             enable_memory_saver=self.server_args.enable_memory_saver,
             enable_mamba_extra_buffer=self.server_args.enable_mamba_extra_buffer(),
-            speculative_num_draft_tokens=self.server_args.speculative_num_draft_tokens,
+            speculative_num_draft_tokens=self.server_args.max_speculative_num_draft_tokens,
             disable_overlap_schedule=self.server_args.disable_overlap_schedule,
             need_sort=self.server_args.disaggregation_mode in ("decode", "prefill"),
             mamba_full_memory_ratio=self.server_args.mamba_full_memory_ratio,
@@ -501,9 +499,7 @@ class KVCacheConfigurator:
             not self.use_mla_backend
         ), "unified memory pool does not support MLA-SWA hybrid yet"
         # Mirror the non-shared path's extra_max_context_len computation.
-        extra_max_context_len = 4
-        if self.server_args.speculative_num_draft_tokens is not None:
-            extra_max_context_len += self.server_args.speculative_num_draft_tokens
+        extra_max_context_len = get_req_to_token_extra_context_len(self.server_args)
         req_to_token_pool = ReqToTokenPool(
             size=max_num_reqs,
             max_context_len=self.model_config.context_len + extra_max_context_len,
@@ -1707,8 +1703,9 @@ class KVCacheConfigurator:
 
         has_spec_dec = not self.spec_algorithm.is_none()
         if has_spec_dec:
-            assert server_args.speculative_num_draft_tokens is not None
+            assert server_args.max_speculative_num_draft_tokens is not None
             assert server_args.max_running_requests is not None
+            draft_width = server_args.max_speculative_num_draft_tokens
 
         if server_args.max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
@@ -1727,7 +1724,7 @@ class KVCacheConfigurator:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * capped_reqs
-                    * server_args.speculative_num_draft_tokens
+                    * draft_width
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
@@ -1745,7 +1742,7 @@ class KVCacheConfigurator:
                 intermediate_size = (
                     config.mamba2_cache_params.mamba_cache_per_req
                     * server_args.max_mamba_cache_size
-                    * server_args.speculative_num_draft_tokens
+                    * draft_width
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
@@ -1767,12 +1764,11 @@ class KVCacheConfigurator:
 
             if has_spec_dec:
                 ratio = self._calculate_mamba_ratio()
-                D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        mamba_budget_bytes // (per_req * (1 + D / ratio))
+                        mamba_budget_bytes // (per_req * (1 + draft_width / ratio))
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -1781,7 +1777,7 @@ class KVCacheConfigurator:
                     server_args.max_running_requests // self.ps.attn_dp_size,
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * capped_reqs * D
+                intermediate_size = per_req * capped_reqs * draft_width
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 server_args.override(

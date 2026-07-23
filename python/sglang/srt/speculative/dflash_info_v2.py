@@ -133,11 +133,13 @@ class DFlashDraftInputV2(SpecInput):
         batch_seq_lens_cpu_t = self._prepare_batch_seq_lens_cpu_buf[:bs]
         cur_kv_lens_cpu_t = self._prepare_cur_kv_lens_cpu_buf[:bs]
 
-        # For DFLASH, each decode step needs a fixed-size verify block.
-        block_size = int(get_server_args().speculative_num_draft_tokens)
+        # The drafter may run a wider fixed block than the target verifies.
+        # Reserve for the larger width so the full draft block always has slots.
+        server_args = get_server_args()
+        block_size = int(server_args.max_speculative_num_draft_tokens or 0)
         if block_size <= 0:
             raise ValueError(
-                f"DFLASH invalid speculative_num_draft_tokens={block_size}."
+                f"DFLASH invalid max speculative draft width={block_size}."
             )
         page_size = batch.token_to_kv_pool_allocator.page_size
         nxt_kv_lens_cpu_t = self._prepare_nxt_kv_lens_cpu_buf[:bs]

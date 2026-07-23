@@ -8,7 +8,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang.srt.server_args as server_args_module
-from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
+from sglang.srt.arg_groups.speculative_hook import (
+    _handle_dflash,
+    handle_speculative_decoding,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_enabled, is_interleave
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -988,6 +991,67 @@ class TestNgramExternalSamArgs(CustomTestCase):
         with self.assertRaises(ValueError) as context:
             handle_speculative_decoding(args)
         self.assertIn("external-corpus-max-tokens", str(context.exception))
+
+
+class TestDFlashVerifyWidthArgs(CustomTestCase):
+    def _make_args(self, **overrides):
+        args = ServerArgs(model_path="dummy")
+        fields = {
+            "device": "cuda",
+            "speculative_algorithm": "DFLASH",
+            "speculative_draft_model_path": "draft",
+            "speculative_dflash_block_size": 16,
+            "speculative_num_draft_tokens": None,
+            "speculative_draft_attention_backend": "triton",
+            "max_running_requests": 8,
+        }
+        fields.update(overrides)
+        for name, value in fields.items():
+            setattr(args, name, value)
+        return args
+
+    def test_verify_width_can_be_smaller_than_draft_block(self):
+        args = self._make_args(speculative_num_draft_tokens=4)
+        _handle_dflash(args)
+
+        self.assertEqual(args.speculative_dflash_block_size, 16)
+        self.assertEqual(args.speculative_num_draft_tokens, 4)
+        self.assertEqual(args.max_speculative_num_draft_tokens, 16)
+
+    def test_verify_width_defaults_to_draft_block(self):
+        args = self._make_args()
+        _handle_dflash(args)
+
+        self.assertEqual(args.speculative_num_draft_tokens, 16)
+        self.assertEqual(args.max_speculative_num_draft_tokens, 16)
+
+    def test_num_draft_tokens_keeps_legacy_block_alias(self):
+        args = self._make_args(
+            speculative_dflash_block_size=None,
+            speculative_num_draft_tokens=8,
+        )
+        _handle_dflash(args)
+
+        self.assertEqual(args.speculative_dflash_block_size, 8)
+        self.assertEqual(args.speculative_num_draft_tokens, 8)
+        self.assertEqual(args.max_speculative_num_draft_tokens, 8)
+
+    def test_verify_width_must_fit_draft_block(self):
+        for verify_width in (0, 17):
+            with self.subTest(verify_width=verify_width):
+                args = self._make_args(
+                    speculative_num_draft_tokens=verify_width,
+                )
+                with self.assertRaises(ValueError):
+                    _handle_dflash(args)
+
+    def test_draft_window_is_checked_against_full_block(self):
+        args = self._make_args(
+            speculative_num_draft_tokens=4,
+            speculative_draft_window_size=8,
+        )
+        with self.assertRaisesRegex(ValueError, "speculative-dflash-block-size"):
+            _handle_dflash(args)
 
 
 class TestDecoupledSpecArgs(CustomTestCase):

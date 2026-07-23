@@ -63,6 +63,7 @@ def build_draft_tp_worker(
     target_model_config: ModelConfig,
     algo_label: str,
     attention_backend_override: Optional[str] = None,
+    num_draft_tokens_override: Optional[int] = None,
 ) -> DraftWorkerBundle:
     draft_server_args = deepcopy(server_args)
     # An override names a draft-specific backend the caller has already
@@ -80,8 +81,7 @@ def build_draft_tp_worker(
     # fa4-draft KV dtype override in configure_kv_cache_dtype), so nulling it
     # would silently skip those paths. context_length keeps the draft aligned
     # with the target.
-    draft_server_args.override(
-        "draft_worker.build",
+    override_kwargs = dict(
         skip_tokenizer_init=True,
         speculative_draft_attention_backend=draft_backend,
         prefill_attention_backend=None,
@@ -89,6 +89,9 @@ def build_draft_tp_worker(
         attention_backend=draft_backend,
         context_length=target_model_config.context_len,
     )
+    if num_draft_tokens_override is not None:
+        override_kwargs["speculative_num_draft_tokens"] = int(num_draft_tokens_override)
+    draft_server_args.override("draft_worker.build", **override_kwargs)
 
     saved_server_args = get_server_args()
     try:
