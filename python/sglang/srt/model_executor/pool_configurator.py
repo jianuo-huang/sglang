@@ -474,7 +474,7 @@ class SWAChunkCapPoolConfigurator(HybridSWAPoolConfigurator):
         sa = kvc.server_args
         page_size = kvc.page_size
         window = kvc.sliding_window_size
-        draft_tokens = sa.speculative_num_draft_tokens or 1
+        draft_tokens = sa.max_speculative_num_draft_tokens or 1
         eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
         """

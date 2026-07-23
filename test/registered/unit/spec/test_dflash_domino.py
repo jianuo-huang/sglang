@@ -6,6 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_utils import (
@@ -180,6 +181,42 @@ class TestDFlashVerifyPrefix(CustomTestCase):
                     torch.full_like(full_correct, verify_width - 1),
                 )
                 torch.testing.assert_close(correct_drafts, expected)
+
+
+class TestDFlashMemorySizing(CustomTestCase):
+    def test_mamba_reserve_uses_full_draft_block(self):
+        def remaining_memory(verify_width):
+            server_args = ServerArgs(model_path="dummy")
+            server_args.speculative_algorithm = "DFLASH"
+            server_args.speculative_dflash_block_size = 16
+            server_args.speculative_num_draft_tokens = verify_width
+            server_args.max_running_requests = 32
+            server_args.max_mamba_cache_size = 160
+            server_args.disable_radix_cache = True
+
+            configurator = object.__new__(KVCacheConfigurator)
+            object.__setattr__(configurator, "server_args", server_args)
+            object.__setattr__(
+                configurator,
+                "spec_algorithm",
+                SimpleNamespace(is_none=lambda: False),
+            )
+            object.__setattr__(
+                configurator,
+                "mambaish_config",
+                SimpleNamespace(
+                    mamba2_cache_params=SimpleNamespace(mamba_cache_per_req=1 << 20)
+                ),
+            )
+            object.__setattr__(
+                configurator,
+                "ps",
+                SimpleNamespace(attn_dp_size=1),
+            )
+            return configurator._handle_max_mamba_cache(100.0)
+
+        self.assertEqual(remaining_memory(8), remaining_memory(16))
+        self.assertEqual(remaining_memory(8), 99.34375)
 
 
 class TestDFlashDraftWorkerConfig(CustomTestCase):
