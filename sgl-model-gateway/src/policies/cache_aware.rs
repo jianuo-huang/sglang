@@ -325,11 +325,43 @@ impl CacheAwarePolicy {
             );
         }
 
-        // Use shortest queue when imbalanced
+        // When imbalanced, keep cache locality within the near-min-load window
+        // (load <= min_load + balance_abs_threshold): pick the longest cached
+        // prefix there, falling back to the shortest-queue worker otherwise.
         let min_load_idx = healthy_indices
             .iter()
             .min_by_key(|&&idx| workers[idx].load())
             .copied()?;
+
+        let selected_idx = request_text
+            .and_then(|text| {
+                let tree = self
+                    .trees
+                    .get(tree_key)
+                    .map(|entry| entry.value().clone())?;
+                let max_near_min_load = min_load.saturating_add(self.config.balance_abs_threshold);
+
+                healthy_indices
+                    .iter()
+                    .copied()
+                    .filter(|&idx| workers[idx].load() <= max_near_min_load)
+                    .filter_map(|idx| {
+                        let matched_chars = tree
+                            .prefix_match_tenant(text, workers[idx].url())
+                            .chars()
+                            .count();
+                        (matched_chars > 0).then_some((idx, matched_chars, workers[idx].load()))
+                    })
+                    // Highest cached-prefix match wins; break ties toward the
+                    // lighter-loaded worker so imbalanced routing still sheds load.
+                    .min_by(|a, b| {
+                        b.1.cmp(&a.1)
+                            .then_with(|| a.2.cmp(&b.2))
+                            .then_with(|| a.0.cmp(&b.0))
+                    })
+                    .map(|(idx, _, _)| idx)
+            })
+            .unwrap_or(min_load_idx);
 
         // Even in imbalanced mode, update the tree to maintain cache state
         if let Some(text) = request_text {
@@ -338,7 +370,7 @@ impl CacheAwarePolicy {
             let tree = self.trees.get(tree_key).map(|entry| entry.value().clone());
 
             if let Some(tree) = tree {
-                let worker_url = workers[min_load_idx].url();
+                let worker_url = workers[selected_idx].url();
                 // Now we can work with the tree without holding the HashMap lock
                 tree.insert(text, worker_url);
 
@@ -365,9 +397,9 @@ impl CacheAwarePolicy {
         }
 
         // Increment processed counter
-        workers[min_load_idx].increment_processed();
+        workers[selected_idx].increment_processed();
 
-        Some(min_load_idx)
+        Some(selected_idx)
     }
 }
 
@@ -640,6 +672,66 @@ mod tests {
             let idx = policy.select_worker(&workers, &info).await.unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    #[tokio::test]
+    async fn test_cache_aware_imbalanced_load_preserves_affinity_near_min_load() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+
+        let worker1 = BasicWorkerBuilder::new("http://w1:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker2 = BasicWorkerBuilder::new("http://w2:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+        let worker3 = BasicWorkerBuilder::new("http://w3:8000")
+            .worker_type(WorkerType::Regular)
+            .build();
+
+        // w2 is the shortest queue, w1 is within the near-min-load window,
+        // and w3 makes the cluster sufficiently imbalanced to enter the
+        // cache-aware load-balancing path.
+        for _ in 0..14 {
+            worker1.increment_load();
+        }
+        for _ in 0..10 {
+            worker2.increment_load();
+        }
+        for _ in 0..25 {
+            worker3.increment_load();
+        }
+
+        let workers: Vec<Arc<dyn Worker>> = vec![
+            Arc::new(worker1),
+            Arc::new(worker2),
+            Arc::new(worker3),
+        ];
+        policy.init_workers(&workers);
+
+        let tree_key = tree_key_for_worker(workers[0].as_ref());
+        let tree = policy.trees.get(&tree_key).unwrap().value().clone();
+        tree.insert("shared-prefix", workers[0].url());
+
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("shared-prefix-next"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // w1 has a cache match and is only four requests above the minimum;
+        // it should beat the uncached shortest-load worker w2.
+        assert_eq!(idx, 0);
     }
 
     #[tokio::test]
