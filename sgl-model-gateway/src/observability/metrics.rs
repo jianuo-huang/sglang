@@ -193,6 +193,26 @@ pub(crate) fn init_metrics() {
         "smg_router_upstream_responses_total",
         "Upstream backend HTTP responses by router_type, status_code, error_code"
     );
+    describe_gauge!(
+        "smg_pd_prefill_admission_active_rooms",
+        "Prefill rooms currently admitted by worker before paired P/D dispatch"
+    );
+    describe_gauge!(
+        "smg_pd_prefill_admission_queued_requests",
+        "HTTP requests waiting in the Router for a per-Prefill-worker room permit"
+    );
+    describe_gauge!(
+        "smg_pd_prefill_admission_room_limit",
+        "Configured Prefill room permits per worker"
+    );
+    describe_counter!(
+        "smg_pd_prefill_admission_decisions_total",
+        "Per-Prefill-worker admission outcomes"
+    );
+    describe_histogram!(
+        "smg_pd_prefill_admission_wait_duration_seconds",
+        "Time spent waiting in the Router for a Prefill room permit"
+    );
 
     // Layer 2: Router inference metrics (gRPC only)
     describe_histogram!(
@@ -633,6 +653,100 @@ impl Metrics {
             "error_code" => error_interned
         )
         .increment(1);
+    }
+
+    /// Set the number of Prefill rooms currently admitted for a worker.
+    pub fn set_pd_prefill_admission_active_rooms(worker: &str, count: usize) {
+        let worker = intern_string(worker);
+        gauge!(
+            "smg_pd_prefill_admission_active_rooms",
+            "worker" => worker
+        )
+        .set(count as f64);
+    }
+
+    /// Adjust active Prefill rooms without a racy read/absolute-set sequence.
+    pub fn increment_pd_prefill_admission_active_rooms(worker: &str, count: usize) {
+        let worker = intern_string(worker);
+        gauge!(
+            "smg_pd_prefill_admission_active_rooms",
+            "worker" => worker
+        )
+        .increment(count as f64);
+    }
+
+    pub fn decrement_pd_prefill_admission_active_rooms(worker: &str, count: usize) {
+        let worker = intern_string(worker);
+        gauge!(
+            "smg_pd_prefill_admission_active_rooms",
+            "worker" => worker
+        )
+        .decrement(count as f64);
+    }
+
+    /// Set the number of requests queued in the Router for a Prefill worker.
+    pub fn set_pd_prefill_admission_queued_requests(worker: &str, count: usize) {
+        let worker = intern_string(worker);
+        gauge!(
+            "smg_pd_prefill_admission_queued_requests",
+            "worker" => worker
+        )
+        .set(count as f64);
+    }
+
+    /// Adjust queued requests atomically in the recorder as waiters race.
+    pub fn increment_pd_prefill_admission_queued_requests(worker: &str) {
+        let worker = intern_string(worker);
+        gauge!(
+            "smg_pd_prefill_admission_queued_requests",
+            "worker" => worker
+        )
+        .increment(1.0);
+    }
+
+    pub fn decrement_pd_prefill_admission_queued_requests(worker: &str) {
+        let worker = intern_string(worker);
+        gauge!(
+            "smg_pd_prefill_admission_queued_requests",
+            "worker" => worker
+        )
+        .decrement(1.0);
+    }
+
+    /// Publish the configured room limit for a Prefill worker.
+    pub fn set_pd_prefill_admission_room_limit(worker: &str, count: usize) {
+        let worker = intern_string(worker);
+        gauge!(
+            "smg_pd_prefill_admission_room_limit",
+            "worker" => worker
+        )
+        .set(count as f64);
+    }
+
+    /// Record a final admission outcome for a Prefill worker.
+    pub fn record_pd_prefill_admission_decision(worker: &str, result: &'static str) {
+        let worker = intern_string(worker);
+        counter!(
+            "smg_pd_prefill_admission_decisions_total",
+            "worker" => worker,
+            "result" => result
+        )
+        .increment(1);
+    }
+
+    /// Record Router-side wait time for a Prefill room permit.
+    pub fn record_pd_prefill_admission_wait(
+        worker: &str,
+        result: &'static str,
+        duration: Duration,
+    ) {
+        let worker = intern_string(worker);
+        histogram!(
+            "smg_pd_prefill_admission_wait_duration_seconds",
+            "worker" => worker,
+            "result" => result
+        )
+        .record(duration.as_secs_f64());
     }
 
     // ========================================================================

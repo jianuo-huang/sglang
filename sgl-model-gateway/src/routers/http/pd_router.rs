@@ -1,4 +1,12 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    borrow::Cow,
+    env,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use axum::{
@@ -7,13 +15,14 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use dashmap::DashMap;
 use futures_util::StreamExt;
-use memchr::memmem;
 use reqwest::Client;
 use serde::Serialize;
 use serde_json::{json, Value};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, TryAcquireError};
 use tokio_stream::wrappers::UnboundedReceiverStream;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use super::pd_types::api_path;
 use crate::{
@@ -29,9 +38,9 @@ use crate::{
     },
     policies::{LoadBalancingPolicy, PolicyRegistry, SelectWorkerInfo},
     protocols::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
+        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        common::{InputIds, StringOrArray},
+        common::{GenerationRequest, InputIds, StringOrArray},
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
@@ -54,6 +63,355 @@ pub struct PDRouter {
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
     pub enable_igw: bool,
+    prefill_admission: PrefillAdmission,
+}
+
+const MAX_PREFILL_ROOMS_ENV: &str = "SGLANG_PD_MAX_PREFILL_ROOMS_PER_WORKER";
+const PREFILL_ROOM_QUEUE_SIZE_ENV: &str = "SGLANG_PD_PREFILL_ROOM_QUEUE_SIZE";
+const PREFILL_ROOM_QUEUE_TIMEOUT_ENV: &str = "SGLANG_PD_PREFILL_ROOM_QUEUE_TIMEOUT_SECS";
+const DEFAULT_PREFILL_ROOM_QUEUE_SIZE: usize = 32_768;
+const DEFAULT_PREFILL_ROOM_QUEUE_TIMEOUT_SECS: u64 = 28_800;
+const REQUEST_ID_HEADER: &str = "x-request-id";
+const REQUEST_ID_BODY_KEY: &str = "rid";
+const MAX_FORWARDED_REQUEST_ID_LEN: usize = 96;
+const SSE_DONE_LINE_WITH_SPACE: &[u8] = b"data: [DONE]";
+const SSE_DONE_LINE_WITHOUT_SPACE: &[u8] = b"data:[DONE]";
+
+/// Incrementally recognizes the OpenAI SSE terminal event without treating a
+/// `data: [DONE]` substring inside a JSON payload as the stream terminator.
+///
+/// Reqwest may split an SSE line across arbitrary HTTP body chunks, so the
+/// detector retains only the current line. The buffer is bounded because a
+/// line longer than either valid sentinel can never become a sentinel later.
+#[derive(Debug, Default)]
+struct SseDoneDetector {
+    line: Vec<u8>,
+    line_too_long: bool,
+}
+
+impl SseDoneDetector {
+    fn observe(&mut self, chunk: &[u8]) -> bool {
+        const MAX_CANDIDATE_LINE_LEN: usize = SSE_DONE_LINE_WITH_SPACE.len() + 1;
+
+        for &byte in chunk {
+            if byte == b'\n' {
+                let line = self.line.strip_suffix(b"\r").unwrap_or(&self.line);
+                let is_done = !self.line_too_long
+                    && (line == SSE_DONE_LINE_WITH_SPACE || line == SSE_DONE_LINE_WITHOUT_SPACE);
+                self.line.clear();
+                self.line_too_long = false;
+                if is_done {
+                    return true;
+                }
+                continue;
+            }
+
+            if !self.line_too_long {
+                if self.line.len() < MAX_CANDIDATE_LINE_LEN {
+                    self.line.push(byte);
+                } else {
+                    self.line.clear();
+                    self.line_too_long = true;
+                }
+            }
+        }
+
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrefillAdmissionConfig {
+    max_rooms_per_worker: usize,
+    queue_size_per_worker: usize,
+    queue_timeout: Duration,
+}
+
+impl PrefillAdmissionConfig {
+    fn optional_env(name: &str) -> Result<Option<String>, String> {
+        match env::var(name) {
+            Ok(value) => Ok(Some(value)),
+            Err(env::VarError::NotPresent) => Ok(None),
+            Err(env::VarError::NotUnicode(_)) => Err(format!("{name} contains non-Unicode data")),
+        }
+    }
+
+    fn parse_usize(name: &str, raw: &str) -> Result<usize, String> {
+        raw.trim()
+            .parse::<usize>()
+            .map_err(|_| format!("{name} must be a non-negative integer, got {raw:?}"))
+    }
+
+    fn from_values(
+        max_rooms: Option<&str>,
+        queue_size: Option<&str>,
+        queue_timeout_secs: Option<&str>,
+    ) -> Result<Option<Self>, String> {
+        let Some(max_rooms) = max_rooms.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let max_rooms_per_worker = Self::parse_usize(MAX_PREFILL_ROOMS_ENV, max_rooms)?;
+        if max_rooms_per_worker == 0 {
+            return Ok(None);
+        }
+        if max_rooms_per_worker > u32::MAX as usize {
+            return Err(format!(
+                "{MAX_PREFILL_ROOMS_ENV} must not exceed {}",
+                u32::MAX
+            ));
+        }
+
+        let queue_size_per_worker = match queue_size {
+            Some(raw) if !raw.trim().is_empty() => {
+                Self::parse_usize(PREFILL_ROOM_QUEUE_SIZE_ENV, raw)?
+            }
+            _ => DEFAULT_PREFILL_ROOM_QUEUE_SIZE,
+        };
+        let queue_timeout_secs = match queue_timeout_secs {
+            Some(raw) if !raw.trim().is_empty() => raw.trim().parse::<u64>().map_err(|_| {
+                format!("{PREFILL_ROOM_QUEUE_TIMEOUT_ENV} must be a positive integer, got {raw:?}")
+            })?,
+            _ => DEFAULT_PREFILL_ROOM_QUEUE_TIMEOUT_SECS,
+        };
+        if queue_timeout_secs == 0 {
+            return Err(format!(
+                "{PREFILL_ROOM_QUEUE_TIMEOUT_ENV} must be greater than zero"
+            ));
+        }
+
+        Ok(Some(Self {
+            max_rooms_per_worker,
+            queue_size_per_worker,
+            queue_timeout: Duration::from_secs(queue_timeout_secs),
+        }))
+    }
+
+    fn from_env() -> Result<Option<Self>, String> {
+        let max_rooms = Self::optional_env(MAX_PREFILL_ROOMS_ENV)?;
+        let queue_size = Self::optional_env(PREFILL_ROOM_QUEUE_SIZE_ENV)?;
+        let queue_timeout = Self::optional_env(PREFILL_ROOM_QUEUE_TIMEOUT_ENV)?;
+        Self::from_values(
+            max_rooms.as_deref(),
+            queue_size.as_deref(),
+            queue_timeout.as_deref(),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct PrefillWorkerAdmission {
+    worker: Arc<str>,
+    semaphore: Arc<Semaphore>,
+    active_rooms: AtomicUsize,
+    queued_requests: AtomicUsize,
+}
+
+impl PrefillWorkerAdmission {
+    fn new(worker: &str, room_limit: usize) -> Self {
+        Metrics::set_pd_prefill_admission_active_rooms(worker, 0);
+        Metrics::set_pd_prefill_admission_queued_requests(worker, 0);
+        Metrics::set_pd_prefill_admission_room_limit(worker, room_limit);
+        Self {
+            worker: Arc::from(worker),
+            semaphore: Arc::new(Semaphore::new(room_limit)),
+            active_rooms: AtomicUsize::new(0),
+            queued_requests: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PrefillRoomPermit {
+    state: Arc<PrefillWorkerAdmission>,
+    rooms: usize,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl PrefillRoomPermit {
+    fn new(state: Arc<PrefillWorkerAdmission>, rooms: usize, permit: OwnedSemaphorePermit) -> Self {
+        state.active_rooms.fetch_add(rooms, Ordering::AcqRel);
+        Metrics::increment_pd_prefill_admission_active_rooms(state.worker.as_ref(), rooms);
+        Self {
+            state,
+            rooms,
+            _permit: permit,
+        }
+    }
+}
+
+impl Drop for PrefillRoomPermit {
+    fn drop(&mut self) {
+        let previous = self
+            .state
+            .active_rooms
+            .fetch_sub(self.rooms, Ordering::AcqRel);
+        debug_assert!(previous >= self.rooms);
+        Metrics::decrement_pd_prefill_admission_active_rooms(
+            self.state.worker.as_ref(),
+            self.rooms,
+        );
+    }
+}
+
+#[derive(Debug)]
+struct PrefillQueueGuard {
+    state: Arc<PrefillWorkerAdmission>,
+}
+
+impl PrefillQueueGuard {
+    fn try_new(state: Arc<PrefillWorkerAdmission>, limit: usize) -> Option<Self> {
+        state
+            .queued_requests
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+                (queued < limit).then_some(queued + 1)
+            })
+            .ok()?;
+        Metrics::increment_pd_prefill_admission_queued_requests(state.worker.as_ref());
+        Some(Self { state })
+    }
+}
+
+impl Drop for PrefillQueueGuard {
+    fn drop(&mut self) {
+        let previous = self.state.queued_requests.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0);
+        Metrics::decrement_pd_prefill_admission_queued_requests(self.state.worker.as_ref());
+    }
+}
+
+#[derive(Debug)]
+enum PrefillAdmissionError {
+    RequestTooLarge {
+        worker: Arc<str>,
+        requested_rooms: usize,
+        room_limit: usize,
+    },
+    QueueFull {
+        worker: Arc<str>,
+        queue_limit: usize,
+    },
+    Timeout {
+        worker: Arc<str>,
+        timeout: Duration,
+    },
+    Closed {
+        worker: Arc<str>,
+    },
+}
+
+#[derive(Debug)]
+struct PrefillAdmission {
+    config: Option<PrefillAdmissionConfig>,
+    workers: DashMap<String, Arc<PrefillWorkerAdmission>>,
+}
+
+impl PrefillAdmission {
+    fn new(config: Option<PrefillAdmissionConfig>) -> Self {
+        Self {
+            config,
+            workers: DashMap::new(),
+        }
+    }
+
+    fn from_env() -> Result<Self, String> {
+        Ok(Self::new(PrefillAdmissionConfig::from_env()?))
+    }
+
+    fn state_for(
+        &self,
+        worker: &str,
+        config: PrefillAdmissionConfig,
+    ) -> Arc<PrefillWorkerAdmission> {
+        self.workers
+            .entry(worker.to_string())
+            .or_insert_with(|| {
+                Arc::new(PrefillWorkerAdmission::new(
+                    worker,
+                    config.max_rooms_per_worker,
+                ))
+            })
+            .clone()
+    }
+
+    async fn acquire(
+        &self,
+        worker: &str,
+        requested_rooms: usize,
+    ) -> Result<Option<PrefillRoomPermit>, PrefillAdmissionError> {
+        let Some(config) = self.config else {
+            return Ok(None);
+        };
+        let requested_rooms = requested_rooms.max(1);
+        let state = self.state_for(worker, config);
+
+        if requested_rooms > config.max_rooms_per_worker {
+            Metrics::record_pd_prefill_admission_decision(worker, "request_too_large");
+            return Err(PrefillAdmissionError::RequestTooLarge {
+                worker: Arc::clone(&state.worker),
+                requested_rooms,
+                room_limit: config.max_rooms_per_worker,
+            });
+        }
+        let requested_rooms_u32 = requested_rooms as u32;
+
+        match Arc::clone(&state.semaphore).try_acquire_many_owned(requested_rooms_u32) {
+            Ok(permit) => {
+                Metrics::record_pd_prefill_admission_decision(worker, "admitted_immediate");
+                return Ok(Some(PrefillRoomPermit::new(state, requested_rooms, permit)));
+            }
+            Err(TryAcquireError::NoPermits) => {}
+            Err(TryAcquireError::Closed) => {
+                Metrics::record_pd_prefill_admission_decision(worker, "closed");
+                return Err(PrefillAdmissionError::Closed {
+                    worker: Arc::clone(&state.worker),
+                });
+            }
+        }
+
+        let Some(queue_guard) =
+            PrefillQueueGuard::try_new(Arc::clone(&state), config.queue_size_per_worker)
+        else {
+            Metrics::record_pd_prefill_admission_decision(worker, "queue_full");
+            return Err(PrefillAdmissionError::QueueFull {
+                worker: Arc::clone(&state.worker),
+                queue_limit: config.queue_size_per_worker,
+            });
+        };
+
+        let wait_start = Instant::now();
+        let acquire = Arc::clone(&state.semaphore).acquire_many_owned(requested_rooms_u32);
+        let result = tokio::time::timeout(config.queue_timeout, acquire).await;
+        let waited = wait_start.elapsed();
+        drop(queue_guard);
+
+        match result {
+            Ok(Ok(permit)) => {
+                Metrics::record_pd_prefill_admission_wait(worker, "admitted", waited);
+                Metrics::record_pd_prefill_admission_decision(worker, "admitted_after_wait");
+                Ok(Some(PrefillRoomPermit::new(state, requested_rooms, permit)))
+            }
+            Ok(Err(_)) => {
+                Metrics::record_pd_prefill_admission_wait(worker, "closed", waited);
+                Metrics::record_pd_prefill_admission_decision(worker, "closed");
+                Err(PrefillAdmissionError::Closed {
+                    worker: Arc::clone(&state.worker),
+                })
+            }
+            Err(_) => {
+                Metrics::record_pd_prefill_admission_wait(worker, "timeout", waited);
+                Metrics::record_pd_prefill_admission_decision(worker, "timeout");
+                Err(PrefillAdmissionError::Timeout {
+                    worker: Arc::clone(&state.worker),
+                    timeout: config.queue_timeout,
+                })
+            }
+        }
+    }
+}
+
+struct PreparedWorkerRequest<'a> {
+    endpoint_url: String,
+    body: Cow<'a, Value>,
 }
 
 #[derive(Clone)]
@@ -77,16 +435,20 @@ struct PDRequestContext<'a> {
 struct BreakerOutcomesRecorded;
 
 impl PDRouter {
+    fn worker_endpoint_url(worker: &dyn Worker, endpoint: &str) -> String {
+        api_path(worker.base_url(), endpoint)
+    }
+
     async fn proxy_to_first_prefill_worker(
         &self,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
         let workers = self.worker_registry.get_prefill_workers();
-        let first_worker_url = workers.first().map(|w| w.url().to_string());
 
-        if let Some(worker_url) = first_worker_url {
-            self.proxy_to_worker(worker_url, endpoint, headers).await
+        if let Some(worker) = workers.first() {
+            self.proxy_to_worker(worker.as_ref(), endpoint, headers)
+                .await
         } else {
             error::service_unavailable("no_prefill_servers", "No prefill servers available")
         }
@@ -94,11 +456,11 @@ impl PDRouter {
 
     async fn proxy_to_worker(
         &self,
-        worker_url: String,
+        worker: &dyn Worker,
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Response {
-        let url = format!("{}/{}", worker_url, endpoint);
+        let url = Self::worker_endpoint_url(worker, endpoint);
         let mut request_builder = self.client.get(&url);
 
         if let Some(headers) = headers {
@@ -169,6 +531,17 @@ impl PDRouter {
     }
 
     pub async fn new(ctx: &Arc<crate::app_context::AppContext>) -> Result<Self, String> {
+        let prefill_admission = PrefillAdmission::from_env()?;
+        if let Some(config) = prefill_admission.config {
+            info!(
+                max_rooms_per_worker = config.max_rooms_per_worker,
+                queue_size_per_worker = config.queue_size_per_worker,
+                queue_timeout_secs = config.queue_timeout.as_secs(),
+                "PD Prefill-phase room admission enabled"
+            );
+        } else {
+            info!("PD Prefill-phase room admission disabled");
+        }
         Ok(PDRouter {
             worker_registry: Arc::clone(&ctx.worker_registry),
             policy_registry: Arc::clone(&ctx.policy_registry),
@@ -176,6 +549,7 @@ impl PDRouter {
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
             enable_igw: ctx.router_config.enable_igw,
+            prefill_admission,
         })
     }
 
@@ -190,6 +564,74 @@ impl PDRouter {
     fn handle_serialization_error(error: impl std::fmt::Display) -> Response {
         error!("Failed to serialize request error={}", error);
         error::internal_error("serialization_failed", "Failed to serialize request")
+    }
+
+    fn handle_prefill_admission_error(error: PrefillAdmissionError) -> Response {
+        match error {
+            PrefillAdmissionError::RequestTooLarge {
+                worker,
+                requested_rooms,
+                room_limit,
+            } => {
+                warn!(
+                    worker = worker.as_ref(),
+                    requested_rooms,
+                    room_limit,
+                    "PD request exceeds the per-Prefill-worker room limit"
+                );
+                error::create_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "prefill_room_request_too_large",
+                    format!(
+                        "Request needs {requested_rooms} Prefill rooms, but worker {worker} has a {room_limit}-room limit"
+                    ),
+                )
+            }
+            PrefillAdmissionError::QueueFull {
+                worker,
+                queue_limit,
+            } => {
+                warn!(
+                    worker = worker.as_ref(),
+                    queue_limit, "PD Prefill room queue is full"
+                );
+                error::create_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "prefill_room_queue_full",
+                    format!(
+                        "Router Prefill room queue for worker {worker} reached {queue_limit} requests"
+                    ),
+                )
+            }
+            PrefillAdmissionError::Timeout { worker, timeout } => {
+                warn!(
+                    worker = worker.as_ref(),
+                    timeout_secs = timeout.as_secs(),
+                    "Timed out waiting for a PD Prefill room"
+                );
+                // This is an intentional overload response, not an upstream
+                // failure. 429 prevents the generic 5xx retry loop from
+                // immediately re-enqueueing the same request.
+                error::create_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "prefill_room_queue_timeout",
+                    format!(
+                        "Timed out after {:.3}s waiting for a Prefill room on worker {worker}",
+                        timeout.as_secs_f64()
+                    ),
+                )
+            }
+            PrefillAdmissionError::Closed { worker } => {
+                error!(
+                    worker = worker.as_ref(),
+                    "PD Prefill admission semaphore unexpectedly closed"
+                );
+                error::service_unavailable(
+                    "prefill_room_admission_closed",
+                    format!("Prefill room admission closed for worker {worker}"),
+                )
+            }
+        }
     }
 
     fn get_generate_batch_size(req: &GenerateRequest) -> Option<usize> {
@@ -224,6 +666,7 @@ impl PDRouter {
     const BOOTSTRAP_HOST_KEY: &'static str = "bootstrap_host";
     const BOOTSTRAP_PORT_KEY: &'static str = "bootstrap_port";
     const BOOTSTRAP_ROOM_KEY: &'static str = "bootstrap_room";
+    const DISAGG_PREFILL_DP_RANK_KEY: &'static str = "disagg_prefill_dp_rank";
 
     fn inject_bootstrap_into_value(
         mut original: Value,
@@ -285,6 +728,122 @@ impl PDRouter {
         Ok(original)
     }
 
+    /// Restore the stable replay/request correlation ID after the public
+    /// OpenAI request has passed through the Router's typed protocol model.
+    /// `openai-protocol` 1.0.0 does not model SGLang's `rid` extension, so the
+    /// ordinary deserialize/serialize path drops it. The replay mirrors that
+    /// value into `x-request-id`; inject it back into the worker JSON once,
+    /// before the same value is cloned for Prefill and Decode.
+    fn inject_request_id_into_value(
+        mut original: Value,
+        headers: Option<&HeaderMap>,
+        batch_size: Option<usize>,
+    ) -> Result<Value, String> {
+        let Some(raw_request_id) = headers
+            .and_then(|headers| headers.get(REQUEST_ID_HEADER))
+            .and_then(|value| value.to_str().ok())
+        else {
+            return Ok(original);
+        };
+        let request_id = raw_request_id.trim();
+        if !Self::is_safe_request_id(request_id) {
+            debug!(
+                request_id_length = request_id.len(),
+                "Ignoring invalid x-request-id for SGLang rid propagation"
+            );
+            return Ok(original);
+        }
+
+        let obj = original
+            .as_object_mut()
+            .ok_or_else(|| "Request must be a JSON object".to_string())?;
+        let rid = match batch_size {
+            Some(size) if size > 1 => Value::Array(
+                (0..size)
+                    .map(|index| Value::from(format!("{request_id}-{index}")))
+                    .collect(),
+            ),
+            _ => Value::from(request_id),
+        };
+        obj.insert(REQUEST_ID_BODY_KEY.to_string(), rid);
+        Ok(original)
+    }
+
+    fn is_safe_request_id(request_id: &str) -> bool {
+        !request_id.is_empty()
+            && request_id.len() <= MAX_FORWARDED_REQUEST_ID_LEN
+            && request_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':')
+            })
+    }
+
+    fn inject_prefill_dp_rank_for_decode<'a>(
+        decode_request: Cow<'a, Value>,
+        prefill_worker: &dyn Worker,
+    ) -> Result<Cow<'a, Value>, String> {
+        let Some(prefill_dp_rank) = prefill_worker.dp_rank() else {
+            return Ok(decode_request);
+        };
+
+        let mut decode_request = decode_request.into_owned();
+        let Some(obj) = decode_request.as_object_mut() else {
+            return Err(
+                "Failed to insert disagg_prefill_dp_rank because request body is not an object"
+                    .to_string(),
+            );
+        };
+
+        obj.insert(
+            Self::DISAGG_PREFILL_DP_RANK_KEY.to_string(),
+            Value::from(prefill_dp_rank as u64),
+        );
+        Ok(Cow::Owned(decode_request))
+    }
+
+    async fn prepare_worker_request<'a>(
+        route: &'static str,
+        worker: &dyn Worker,
+        json_request: Cow<'a, Value>,
+    ) -> Result<PreparedWorkerRequest<'a>, String> {
+        let body = if worker.is_dp_aware() {
+            Cow::Owned(
+                worker
+                    .prepare_request(json_request.into_owned())
+                    .await
+                    .map_err(|err| {
+                        format!(
+                            "Failed to prepare request for worker {}: {}",
+                            worker.url(),
+                            err
+                        )
+                    })?,
+            )
+        } else {
+            json_request
+        };
+
+        Ok(PreparedWorkerRequest {
+            endpoint_url: Self::worker_endpoint_url(worker, route),
+            body,
+        })
+    }
+
+    async fn prepare_pd_worker_requests<'a>(
+        route: &'static str,
+        json_request: &'a Value,
+        prefill: &dyn Worker,
+        decode: &dyn Worker,
+    ) -> Result<(PreparedWorkerRequest<'a>, PreparedWorkerRequest<'a>), String> {
+        let prefill_request =
+            Self::prepare_worker_request(route, prefill, Cow::Borrowed(json_request)).await?;
+        let decode_json_request =
+            Self::inject_prefill_dp_rank_for_decode(Cow::Borrowed(json_request), prefill)?;
+        let decode_request =
+            Self::prepare_worker_request(route, decode, decode_json_request).await?;
+
+        Ok((prefill_request, decode_request))
+    }
+
     async fn execute_dual_dispatch<T: Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
@@ -338,7 +897,44 @@ impl PDRouter {
                             decode.url()
                         );
 
+                        // Reserve the selected Prefill in routing load before
+                        // waiting for its room permit. Cache-aware falls back
+                        // to minimum load for cold prefixes; if Router-queued
+                        // requests were invisible here, a full admission set
+                        // would leave all workers tied and deterministic tie
+                        // breaking could pile every later cold request onto one
+                        // Prefill. This guard represents Router-side assigned
+                        // work only: no P/D HTTP request or GPU allocation has
+                        // happened yet. It is released at the same Prefill
+                        // phase boundary as before, or immediately on any
+                        // admission/preparation failure.
+                        let prefill_guard =
+                            WorkerLoadGuard::new(prefill.clone(), context.headers.as_ref());
+
+                        // Keep excess work in the Router. The paired Decode
+                        // request must not be sent until the selected Prefill
+                        // worker has room, otherwise Decode allocates target
+                        // KV/state while merely waiting for Prefill output.
+                        let requested_rooms = context.batch_size.unwrap_or(1);
+                        let prefill_room_permit = match self
+                            .prefill_admission
+                            .acquire(prefill.url(), requested_rooms)
+                            .await
+                        {
+                            Ok(permit) => permit,
+                            Err(e) => return Self::handle_prefill_admission_error(e),
+                        };
+
                         let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
+                            Ok(v) => v,
+                            Err(e) => return Self::handle_serialization_error(e),
+                        };
+
+                        json_request = match Self::inject_request_id_into_value(
+                            json_request,
+                            context.headers.as_ref(),
+                            context.batch_size,
+                        ) {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
@@ -360,6 +956,8 @@ impl PDRouter {
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
+                                prefill_guard,
+                                prefill_room_permit,
                                 start_time,
                             )
                             .await;
@@ -446,8 +1044,8 @@ impl PDRouter {
         &self,
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        decode_guard: WorkerLoadGuard,
     ) -> Response {
         let status = res.status();
 
@@ -490,8 +1088,8 @@ impl PDRouter {
                 None,
                 context.return_logprob,
                 Some(response_headers),
-                prefill,
                 decode,
+                decode_guard,
             )
         } else {
             // Handle non-streaming error response
@@ -573,47 +1171,134 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        prefill_guard: WorkerLoadGuard,
+        prefill_room_permit: Option<PrefillRoomPermit>,
         _start_time: Instant,
     ) -> Response {
-        // For non-streaming: use guard for automatic load management
-        // For streaming: load will be managed in create_streaming_response
-        let _prefill_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(prefill.clone(), headers));
-        let _decode_guard =
-            (!context.is_stream).then(|| WorkerLoadGuard::new(decode.clone(), headers));
-
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
         let headers = Some(&headers_with_trace);
 
+        let (prepared_prefill, prepared_decode) = match Self::prepare_pd_worker_requests(
+            context.route,
+            &json_request,
+            prefill.as_ref(),
+            decode.as_ref(),
+        )
+        .await
+        {
+            Ok(requests) => requests,
+            Err(e) => {
+                error!("Failed to prepare PD worker requests: {}", e);
+                return error::internal_error("pd_request_preparation_failed", e);
+            }
+        };
+
+        // Prefill load is a phase load, not an end-to-end stream load. Decode
+        // remains active until its non-streaming body is read or its streaming
+        // response body is dropped.
+        let mut decode_guard = Some(WorkerLoadGuard::new(decode.clone(), headers));
+
         // Build both requests
         let prefill_request = self.build_post_with_headers(
             &self.client,
-            prefill.url(),
-            context.route,
-            &json_request,
+            &prepared_prefill.endpoint_url,
+            &prepared_prefill.body,
             headers,
             false,
         );
         let decode_request = self.build_post_with_headers(
             &self.client,
-            decode.url(),
-            context.route,
-            &json_request,
+            &prepared_decode.endpoint_url,
+            &prepared_decode.body,
             headers,
             false,
         );
 
-        // Send both requests concurrently and wait for both
-        // Note: Using borrowed references avoids heap allocation
+        // Run both in this handler task (not a detached tokio::spawn) so a client
+        // disconnect cancels the pending decode request too, keeping the
+        // upstream-cancel behavior from #19524.
         events::RequestPDSentEvent {
             prefill_url: prefill.url(),
             decode_url: decode.url(),
         }
         .emit();
 
-        let (prefill_result, decode_result) =
-            tokio::join!(prefill_request.send(), decode_request.send());
+        let prefill_fut = prefill_request.send();
+        let decode_fut = decode_request.send();
+        tokio::pin!(prefill_fut);
+        tokio::pin!(decode_fut);
+
+        // Poll both until prefill resolves; decode normally resolves later, but
+        // may resolve first if it rejects the request outright.
+        let prefill_result;
+        let mut decode_early: Option<Result<reqwest::Response, reqwest::Error>> = None;
+        loop {
+            tokio::select! {
+                biased;
+                pr = &mut prefill_fut => {
+                    prefill_result = pr;
+                    break;
+                }
+                dr = &mut decode_fut, if decode_early.is_none() => {
+                    decode_early = Some(dr);
+                }
+            }
+        }
+
+        // SGLang emits the Prefill HTTP response only after its forward and KV
+        // handoff have completed. Release both the routing load and the room
+        // permit at that phase boundary, before waiting for Decode generation.
+        // This is the key distinction from the old end-to-end global limiter.
+        drop(prefill_guard);
+        drop(prefill_room_permit);
+
+        // Decode can't generate without prefill's KV, so any prefill failure
+        // (non-2xx / transport error) dooms the paired decode request, which would
+        // otherwise block in WaitingForInput until the 300s disaggregation
+        // timeout. Drop the decode future to close its connection; the decode
+        // engine then detects the disconnect and aborts the request in ~4-8s.
+        let prefill_failed = match &prefill_result {
+            Ok(resp) => !resp.status().is_success(),
+            Err(_) => true,
+        };
+
+        if prefill_failed {
+            warn!(
+                "Prefill failed, aborting paired decode request decode_url={} prefill_url={}",
+                decode.url(),
+                prefill.url()
+            );
+
+            // Tick prefill by its real status (4xx = client fault). Don't record
+            // decode: it was cancelled due to a prefill fault, not its own, so a
+            // prefill error storm can't trip healthy decode breakers.
+            let prefill_ok = match &prefill_result {
+                Ok(r) => r.status().is_client_error(),
+                Err(_) => false,
+            };
+            prefill.record_outcome(prefill_ok);
+
+            // Status-faithful error shaping (4xx forwarded, transport/5xx -> 502).
+            let mut response = match self
+                .process_prefill_response(prefill_result, prefill.url(), false)
+                .await
+            {
+                Err(error_response) => error_response,
+                Ok(_) => error::bad_gateway(
+                    "prefill_server_error",
+                    "Prefill reported failure but returned a success response".to_string(),
+                ),
+            };
+            response.extensions_mut().insert(BreakerOutcomesRecorded);
+            return response;
+        }
+
+        // Prefill ok: take decode's result, awaiting it if still pending.
+        let decode_result = match decode_early {
+            Some(dr) => dr,
+            None => (&mut decode_fut).await,
+        };
 
         events::RequestReceivedEvent {}.emit();
 
@@ -660,7 +1345,14 @@ impl PDRouter {
                     }
 
                     let mut response = self
-                        .handle_decode_error_response(res, &context, prefill, decode)
+                        .handle_decode_error_response(
+                            res,
+                            &context,
+                            decode,
+                            decode_guard
+                                .take()
+                                .expect("Decode load guard must exist until response completion"),
+                        )
                         .await;
                     response.extensions_mut().insert(BreakerOutcomesRecorded);
                     return response;
@@ -711,8 +1403,10 @@ impl PDRouter {
                         prefill_logprobs,
                         context.return_logprob,
                         Some(response_headers),
-                        prefill,
                         decode,
+                        decode_guard
+                            .take()
+                            .expect("Decode load guard must exist until response completion"),
                     )
                 } else {
                     // Non-streaming response
@@ -788,6 +1482,28 @@ impl PDRouter {
         let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
+    }
+
+    /// Builds the text used for cache-aware routing of a chat request.
+    ///
+    /// This must reflect the *full* conversation (system prompt, prior turns,
+    /// the current message and tool context) so that KV-cache prefix matching
+    /// routes to the worker that actually shares the most prefix. Using only the
+    /// first message ignores the conversation history that drives KV reuse in
+    /// multi-turn chats. See https://github.com/sgl-project/sglang/issues/26263.
+    ///
+    /// Returns `None` when the conversation has no text to route on, preserving
+    /// the prior behavior of not feeding an empty key into prefix matching.
+    fn build_chat_request_text(body: &ChatCompletionRequest) -> Option<String> {
+        // `extract_text_for_routing` walks every message (system, prior turns,
+        // current message, tool content) and is the same routing text the regular
+        // (non-PD) router uses, keeping cache-aware routing consistent across both.
+        let text = body.extract_text_for_routing();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text)
+        }
     }
 
     async fn select_pd_pair(
@@ -929,8 +1645,8 @@ impl PDRouter {
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
         headers: Option<HeaderMap>,
-        prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        decode_guard: WorkerLoadGuard,
     ) -> Response {
         use crate::core::AttachedBody;
 
@@ -958,13 +1674,14 @@ impl PDRouter {
         }
         let decode_for_log = decode.clone();
         tokio::spawn(async move {
+            let mut done_detector = SseDoneDetector::default();
             loop {
                 tokio::select! {
                     biased;
                     chunk_result = tracked.next() => {
                         match chunk_result {
                             Some(Ok(chunk)) => {
-                                let is_done = memmem::find(&chunk, b"data: [DONE]").is_some();
+                                let is_done = done_detector.observe(&chunk);
 
                                 let result = if return_logprob && prefill_logprobs.is_some() {
                                     Self::merge_streaming_logprobs(prefill_logprobs.clone(), &chunk)
@@ -1019,11 +1736,6 @@ impl PDRouter {
         let stream = UnboundedReceiverStream::new(rx);
         let body = Body::from_stream(stream);
 
-        let guards = vec![
-            WorkerLoadGuard::new(prefill, headers.as_ref()),
-            WorkerLoadGuard::new(decode, headers.as_ref()),
-        ];
-
         let mut response = Response::new(body);
         *response.status_mut() = status;
 
@@ -1031,7 +1743,7 @@ impl PDRouter {
         response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         *response.headers_mut() = response_headers;
 
-        AttachedBody::wrap_response(response, guards)
+        AttachedBody::wrap_response(response, decode_guard)
     }
 
     // Helper to process non-streaming decode response with logprob merging
@@ -1179,13 +1891,12 @@ impl PDRouter {
     fn build_post_with_headers(
         &self,
         client: &Client,
-        url: &str,
-        route: &'static str,
+        endpoint_url: &str,
         json_request: &Value,
         headers: Option<&HeaderMap>,
         connection_close: bool,
     ) -> reqwest::RequestBuilder {
-        let mut request = client.post(api_path(url, route)).json(json_request);
+        let mut request = client.post(endpoint_url).json(json_request);
         if connection_close {
             request = request.header("Connection", "close");
         }
@@ -1293,12 +2004,11 @@ impl RouterTrait for PDRouter {
             }
         };
 
-        let prefill_url = format!("{}/health_generate", prefill.url());
+        let prefill_url = Self::worker_endpoint_url(prefill.as_ref(), "health_generate");
+        let decode_url = Self::worker_endpoint_url(decode.as_ref(), "health_generate");
         let (prefill_result, decode_result) = tokio::join!(
             self.client.get(&prefill_url).send(),
-            self.client
-                .get(format!("{}/health_generate", decode.url()))
-                .send()
+            self.client.get(&decode_url).send()
         );
 
         // Check results
@@ -1422,18 +2132,7 @@ impl RouterTrait for PDRouter {
         let return_logprob = body.logprobs;
 
         let request_text = if self.policies_need_request_text() {
-            body.messages.first().and_then(|msg| match msg {
-                ChatMessage::User { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::Developer { content, .. } => match content {
-                    MessageContent::Text(text) => Some(text.clone()),
-                    MessageContent::Parts(_) => None,
-                },
-                ChatMessage::System { content, .. } => Some(content.to_simple_string()),
-                _ => None,
-            })
+            Self::build_chat_request_text(body)
         } else {
             None
         };
@@ -1550,7 +2249,8 @@ impl RouterTrait for PDRouter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{BasicWorkerBuilder, WorkerType};
+    use crate::core::{BasicWorkerBuilder, DPAwareWorkerBuilder, WorkerType};
+    use crate::policies::{CacheAwareConfig, CacheAwarePolicy, SelectWorkerInfo};
 
     fn create_test_pd_router() -> PDRouter {
         let worker_registry = Arc::new(WorkerRegistry::new());
@@ -1564,6 +2264,7 @@ mod tests {
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
             enable_igw: false,
+            prefill_admission: PrefillAdmission::new(None),
         }
     }
 
@@ -1573,6 +2274,87 @@ mod tests {
             .build();
         worker.set_healthy(healthy);
         Box::new(worker)
+    }
+
+    #[test]
+    fn test_sse_done_detector_requires_a_complete_data_line() {
+        let mut detector = SseDoneDetector::default();
+        let embedded = br#"data: {"choices":[{"delta":{"tool_calls":[{"function":{"arguments":"w.Write([]byte(\"data: [DONE]\\n\\n\"))"}}]}}]}
+
+"#;
+
+        assert!(!detector.observe(embedded));
+        assert!(detector.observe(b"data: [DONE]\n\n"));
+    }
+
+    #[test]
+    fn test_sse_done_detector_handles_chunk_boundaries_and_crlf() {
+        let mut detector = SseDoneDetector::default();
+
+        assert!(!detector.observe(b"data: [DO"));
+        assert!(!detector.observe(b"NE]\r"));
+        assert!(detector.observe(b"\n\r\n"));
+
+        let mut no_space = SseDoneDetector::default();
+        assert!(no_space.observe(b"data:[DONE]\n"));
+    }
+
+    #[test]
+    fn test_sse_done_detector_rejects_prefixes_and_suffixes() {
+        let mut detector = SseDoneDetector::default();
+
+        assert!(!detector.observe(b"prefix data: [DONE]\n"));
+        assert!(!detector.observe(b"data: [DONE] suffix\n"));
+        assert!(detector.observe(b"data: [DONE]\n"));
+    }
+
+    #[test]
+    fn test_chat_request_text_uses_full_conversation() {
+        // Regression test for https://github.com/sgl-project/sglang/issues/26263
+        // Cache-aware routing must build its text from the full conversation, not
+        // just the first message, so that KV-cache prefix matching reflects what
+        // the worker will actually process in a multi-turn chat.
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "First question about apples."},
+                {"role": "assistant", "content": "Apples are red."},
+                {"role": "user", "content": "Follow up question about oranges."}
+            ]
+        }))
+        .expect("valid chat request");
+
+        let text = PDRouter::build_chat_request_text(&body)
+            .expect("multi-message chat should produce routing text");
+
+        assert!(
+            text.contains("apples"),
+            "routing text must include earlier turns, got: {text:?}"
+        );
+        assert!(
+            text.contains("oranges"),
+            "routing text must include later turns (not only the first message), got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_text_none_when_no_text() {
+        // When the conversation carries no text content, no routing text should
+        // be produced (None) rather than an empty string, preserving the prior
+        // PD behavior. See https://github.com/sgl-project/sglang/issues/26263.
+        let body: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "test-model",
+            "messages": [
+                {"role": "user", "content": ""}
+            ]
+        }))
+        .expect("valid chat request");
+
+        assert!(
+            PDRouter::build_chat_request_text(&body).is_none(),
+            "empty conversation text should produce None, not Some(\"\")"
+        );
     }
 
     #[tokio::test]
@@ -1617,6 +2399,101 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No prefill workers available"));
+    }
+
+    #[test]
+    fn test_worker_endpoint_url_uses_base_url_for_dp_aware_worker() {
+        let worker = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+
+        assert_eq!(
+            PDRouter::worker_endpoint_url(&worker, "health_generate"),
+            "http://prefill:30000/health_generate"
+        );
+        assert_eq!(
+            PDRouter::worker_endpoint_url(&worker, "/v1/models"),
+            "http://prefill:30000/v1/models"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_prepare_pd_worker_requests_uses_dp_aware_rank() {
+        let prefill = DPAwareWorkerBuilder::new("http://prefill:30000", 2, 4)
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = DPAwareWorkerBuilder::new("http://decode:30001", 1, 4)
+            .worker_type(WorkerType::Decode)
+            .build();
+        let request = json!({
+            "prompt": "shared prefix",
+            "max_tokens": 8,
+            "bootstrap_host": "prefill",
+            "bootstrap_port": 8998,
+            "bootstrap_room": 1234,
+        });
+
+        let (prefill_request, decode_request) =
+            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            prefill_request.endpoint_url,
+            "http://prefill:30000/v1/completions"
+        );
+        assert_eq!(prefill_request.body["data_parallel_rank"], 2);
+        assert!(prefill_request.body.get("disagg_prefill_dp_rank").is_none());
+
+        assert_eq!(
+            decode_request.endpoint_url,
+            "http://decode:30001/v1/completions"
+        );
+        assert_eq!(decode_request.body["data_parallel_rank"], 1);
+        assert_eq!(decode_request.body["disagg_prefill_dp_rank"], 2);
+        assert_eq!(decode_request.body["bootstrap_room"], 1234);
+        assert!(matches!(prefill_request.body, Cow::Owned(_)));
+        assert!(matches!(decode_request.body, Cow::Owned(_)));
+    }
+
+    #[tokio::test]
+    async fn test_prepare_pd_worker_requests_preserves_non_dp_workers() {
+        let prefill = BasicWorkerBuilder::new("http://prefill:30000")
+            .worker_type(WorkerType::Prefill {
+                bootstrap_port: Some(8998),
+            })
+            .build();
+        let decode = BasicWorkerBuilder::new("http://decode:30001")
+            .worker_type(WorkerType::Decode)
+            .build();
+        let request = json!({
+            "prompt": "shared prefix",
+            "max_tokens": 8,
+            "bootstrap_room": 1234,
+        });
+
+        let (prefill_request, decode_request) =
+            PDRouter::prepare_pd_worker_requests("/v1/completions", &request, &prefill, &decode)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            prefill_request.endpoint_url,
+            "http://prefill:30000/v1/completions"
+        );
+        assert_eq!(
+            decode_request.endpoint_url,
+            "http://decode:30001/v1/completions"
+        );
+        assert!(prefill_request.body.get("data_parallel_rank").is_none());
+        assert!(decode_request.body.get("data_parallel_rank").is_none());
+        assert!(decode_request.body.get("disagg_prefill_dp_rank").is_none());
+        assert!(matches!(prefill_request.body, Cow::Borrowed(_)));
+        assert!(matches!(decode_request.body, Cow::Borrowed(_)));
     }
 
     #[test]
@@ -1680,18 +2557,20 @@ mod tests {
         let stream = UnboundedReceiverStream::new(rx);
 
         {
+            let decode_guard = WorkerLoadGuard::new(decode_ref.clone(), None);
             let response = router.create_streaming_response(
                 stream.map(Ok),
                 StatusCode::OK,
                 None,
                 false,
                 None,
-                prefill_ref.clone(),
                 decode_ref.clone(),
+                decode_guard,
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            // Prefill is a completed phase by the time a Decode stream is
+            // returned; only Decode stays attached to the response body.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(bytes::Bytes::from("test data")).unwrap();
@@ -1699,7 +2578,7 @@ mod tests {
             sleep(Duration::from_millis(10)).await;
 
             // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);
@@ -1711,5 +2590,222 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    #[test]
+    fn test_prefill_admission_config_values() {
+        assert_eq!(
+            PrefillAdmissionConfig::from_values(None, Some("bad"), Some("bad")).unwrap(),
+            None,
+            "queue settings are inert when the room limiter is disabled"
+        );
+        assert_eq!(
+            PrefillAdmissionConfig::from_values(Some("0"), None, None).unwrap(),
+            None
+        );
+
+        let config = PrefillAdmissionConfig::from_values(Some("16"), Some("8192"), Some("21600"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.max_rooms_per_worker, 16);
+        assert_eq!(config.queue_size_per_worker, 8192);
+        assert_eq!(config.queue_timeout, Duration::from_secs(21_600));
+
+        assert!(PrefillAdmissionConfig::from_values(Some("bad"), None, None).is_err());
+        assert!(PrefillAdmissionConfig::from_values(Some("16"), None, Some("0")).is_err());
+    }
+
+    #[test]
+    fn test_request_id_is_restored_for_prefill_and_decode_json() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REQUEST_ID_HEADER,
+            HeaderValue::from_static("pressure-full-2102-a1b2c3"),
+        );
+        let original = json!({"model": "qwen", "messages": []});
+
+        let first =
+            PDRouter::inject_request_id_into_value(original.clone(), Some(&headers), None).unwrap();
+        let repeated =
+            PDRouter::inject_request_id_into_value(original, Some(&headers), None).unwrap();
+
+        assert_eq!(first[REQUEST_ID_BODY_KEY], "pressure-full-2102-a1b2c3");
+        assert_eq!(first[REQUEST_ID_BODY_KEY], repeated[REQUEST_ID_BODY_KEY]);
+    }
+
+    #[test]
+    fn test_request_id_batch_is_unique_and_deterministic() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            REQUEST_ID_HEADER,
+            HeaderValue::from_static("pressure-batch"),
+        );
+        let value = PDRouter::inject_request_id_into_value(
+            json!({"model": "qwen", "messages": []}),
+            Some(&headers),
+            Some(3),
+        )
+        .unwrap();
+
+        assert_eq!(
+            value[REQUEST_ID_BODY_KEY],
+            json!(["pressure-batch-0", "pressure-batch-1", "pressure-batch-2"])
+        );
+    }
+
+    #[test]
+    fn test_invalid_request_id_is_not_injected() {
+        for invalid in ["contains space", "slash/not/allowed", "", &"x".repeat(97)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(REQUEST_ID_HEADER, HeaderValue::from_str(invalid).unwrap());
+            let value = PDRouter::inject_request_id_into_value(
+                json!({"model": "qwen", "messages": []}),
+                Some(&headers),
+                None,
+            )
+            .unwrap();
+            assert!(
+                value.get(REQUEST_ID_BODY_KEY).is_none(),
+                "invalid={invalid:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_prefill_admission_queues_before_dispatch_and_releases_rooms() {
+        use tokio::time::timeout;
+
+        let admission = Arc::new(PrefillAdmission::new(Some(PrefillAdmissionConfig {
+            max_rooms_per_worker: 2,
+            queue_size_per_worker: 1,
+            queue_timeout: Duration::from_secs(1),
+        })));
+        let worker = "http://prefill:30000";
+        let first = admission.acquire(worker, 2).await.unwrap().unwrap();
+        let state = admission.workers.get(worker).unwrap().clone();
+        assert_eq!(state.active_rooms.load(Ordering::Acquire), 2);
+
+        let waiting_admission = Arc::clone(&admission);
+        let waiter =
+            tokio::spawn(async move { waiting_admission.acquire("http://prefill:30000", 1).await });
+        timeout(Duration::from_secs(1), async {
+            while state.queued_requests.load(Ordering::Acquire) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("request should enter the Router-side queue");
+
+        assert!(matches!(
+            admission.acquire(worker, 1).await,
+            Err(PrefillAdmissionError::QueueFull { .. })
+        ));
+
+        drop(first);
+        let second = timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("queued request should receive the released room")
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.queued_requests.load(Ordering::Acquire), 0);
+        assert_eq!(state.active_rooms.load(Ordering::Acquire), 1);
+        drop(second);
+        assert_eq!(state.active_rooms.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_router_queued_prefill_reservation_is_visible_to_cold_routing() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        });
+        let workers: Vec<Arc<dyn Worker>> = (0..2)
+            .map(|index| {
+                let worker = Arc::new(
+                    BasicWorkerBuilder::new(format!("http://prefill-{index}:8000"))
+                        .worker_type(WorkerType::Prefill {
+                            bootstrap_port: Some(8998),
+                        })
+                        .build(),
+                );
+                worker.set_healthy(true);
+                worker as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+
+        let first = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("aaaa"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let _first_guard = WorkerLoadGuard::new(workers[first].clone(), None);
+        let second = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("bbbb"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(first, second);
+        let _second_guard = WorkerLoadGuard::new(workers[second].clone(), None);
+
+        // Both workers now have one admitted/assigned request. A third cold
+        // request may deterministically select either worker, but its routing
+        // reservation must become visible while it waits for admission so the
+        // fourth cold request selects the other worker instead of joining the
+        // same invisible Router queue.
+        let queued = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("cccc"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let _queued_guard = WorkerLoadGuard::new(workers[queued].clone(), None);
+        let next = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    request_text: Some("dddd"),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_ne!(queued, next);
+    }
+
+    #[tokio::test]
+    async fn test_prefill_admission_rejects_oversized_and_times_out() {
+        let admission = PrefillAdmission::new(Some(PrefillAdmissionConfig {
+            max_rooms_per_worker: 1,
+            queue_size_per_worker: 1,
+            queue_timeout: Duration::from_millis(10),
+        }));
+        let worker = "http://prefill:30000";
+
+        assert!(matches!(
+            admission.acquire(worker, 2).await,
+            Err(PrefillAdmissionError::RequestTooLarge { .. })
+        ));
+        let first = admission.acquire(worker, 1).await.unwrap().unwrap();
+        assert!(matches!(
+            admission.acquire(worker, 1).await,
+            Err(PrefillAdmissionError::Timeout { .. })
+        ));
+        drop(first);
     }
 }
